@@ -1,0 +1,3527 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="description" content="【演示版】A股散户交易复盘与纪律工具：交割单导入、复盘账本、基础归因看板、纪律执行率。全部数据本地 SQLite 存储，你的交割单不离开你的电脑。">
+  <title>复盘工作台 · 演示版（本地模拟数据 · 双击即开）</title>
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><rect width='100' height='100' rx='20' fill='%234f46e5'/><text x='50' y='68' font-size='52' text-anchor='middle' fill='white'>复</text></svg>">
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/sql.js/1.10.3/sql-wasm.js"></script>
+  <style>
+/* app.css — 原型自定义样式（Tailwind 之外的少量补充） */
+
+/* A股配色约定：红涨（盈）绿跌（亏），与热力图/盈亏数字一致 */
+
+html { font-family: -apple-system, "PingFang SC", "Microsoft YaHei", "Helvetica Neue", sans-serif; }
+
+/* 细滚动条 */
+::-webkit-scrollbar { width: 8px; height: 8px; }
+::-webkit-scrollbar-thumb { background: #cbd5e1; border-radius: 4px; }
+::-webkit-scrollbar-thumb:hover { background: #94a3b8; }
+
+/* 表格数字等宽，方便对账 */
+td { font-variant-numeric: tabular-nums; }
+
+/* 弹窗动画 */
+#modal-root > div { animation: fadeIn .15s ease-out; }
+@keyframes fadeIn { from { opacity: 0; } to { opacity: 1; } }
+
+/* KPI 卡片可点击提示 */
+.kpi-card { cursor: pointer; }
+.kpi-card:hover { transform: translateY(-1px); }
+
+  </style>
+</head>
+<body class="bg-slate-100 text-slate-800">
+  <div id="boot-mask" class="fixed inset-0 bg-slate-100 flex items-center justify-center z-[100]">
+    <div class="text-slate-500 text-sm animate-pulse">正在加载本地数据库（sql.js WASM）…</div>
+  </div>
+
+  <div id="app" class="flex h-screen overflow-hidden">
+    <!-- 左侧导航：归因/纪律居上部（首屏权重 ≥70% 硬约束） -->
+    <aside class="w-56 shrink-0 bg-white border-r border-slate-200 flex flex-col">
+      <div class="px-4 py-5 border-b border-slate-100">
+        <div class="font-bold text-lg leading-tight">复盘工作台</div>
+        <div class="text-xs text-slate-400 mt-0.5">A股复盘 · 纪律 · 归因</div>
+      </div>
+      <nav id="nav" class="flex-1 p-3 space-y-1 overflow-y-auto"></nav>
+      <div class="p-3 border-t border-slate-100 space-y-2">
+        <button id="btn-export" class="w-full text-xs px-3 py-2 rounded-lg bg-slate-100 hover:bg-slate-200 text-slate-600">导出 .sqlite 数据库文件</button>
+        <div id="user-badge" class="text-xs text-slate-400 text-center"></div>
+        <p class="text-[10px] text-slate-300 text-center leading-relaxed">数据仅存本地浏览器<br>投资有风险，入市需谨慎</p>
+      </div>
+    </aside>
+
+    <!-- 主区域 -->
+    <main class="flex-1 overflow-y-auto">
+      <header class="sticky top-0 z-10 bg-slate-100/90 backdrop-blur border-b border-slate-200 px-6 py-4">
+        <h1 id="view-title" class="font-bold text-xl"></h1>
+        <p id="view-sub" class="text-xs text-slate-400 mt-0.5"></p>
+      </header>
+      <div id="view"></div>
+    </main>
+  </div>
+
+  <div id="modal-root"></div>
+  <script>
+
+// ============================================================
+// ===== 拼接文件 1/10：js/db.js =====
+// ============================================================
+// ============================================================
+// db.js — sql.js(SQLite WASM) 封装 + DDL 初始化 + IndexedDB 持久化
+// 数据红线：全部账户数据仅存本地浏览器，绝不外发（产品文档 §7.1
+// 「你的交割单不离开你的电脑」）
+// ============================================================
+
+const SQLJS_CDN = 'https://cdnjs.cloudflare.com/ajax/libs/sql.js/1.10.3';
+const IDB_NAME = 'astock_review_proto';
+const IDB_STORE = 'kv';
+const DUMP_KEY = 'sqlite_dump';
+
+let db = null;
+let saveTimer = null;
+
+// ---------- 通用工具 ----------
+function uuid() {
+  return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, c => {
+    const r = (Math.random() * 16) | 0;
+    return (c === 'x' ? r : (r & 0x3) | 0x8).toString(16);
+  });
+}
+function now() { return Math.floor(Date.now() / 1000); }
+
+function pad(n) { return String(n).padStart(2, '0'); }
+
+function fmtDate(ts) {           // 秒级时间戳 -> 'YYYY-MM-DD'
+  const d = new Date(ts * 1000);
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
+}
+function fmtTime(ts) {           // -> 'HH:MM'
+  const d = new Date(ts * 1000);
+  return `${pad(d.getHours())}:${pad(d.getMinutes())}`;
+}
+function fmtDateTime(ts) { return `${fmtDate(ts)} ${fmtTime(ts)}`; }
+function fmtMoney(n) {
+  if (n === null || n === undefined || isNaN(n)) return '-';
+  return Number(n).toLocaleString('zh-CN', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+}
+function fmtPct(x, digits = 1) { // 0.833 -> '83.3%'
+  if (x === null || x === undefined || isNaN(x)) return '-';
+  return (x * 100).toFixed(digits) + '%';
+}
+function dayKey(ts) { return fmtDate(ts); }
+function monthKey(ts) { const d = new Date(ts * 1000); return `${d.getFullYear()}-${pad(d.getMonth() + 1)}`; }
+
+// ISO 周（周一起算）：'2026-W37'，供「单周交易次数」规则使用
+function weekKey(ts) {
+  const d = new Date(ts * 1000);
+  const dt = new Date(Date.UTC(d.getFullYear(), d.getMonth(), d.getDate()));
+  const dayNum = (dt.getUTCDay() + 6) % 7;            // 周一=0
+  dt.setUTCDate(dt.getUTCDate() - dayNum + 3);        // 本周周四
+  const firstThursday = new Date(Date.UTC(dt.getUTCFullYear(), 0, 4));
+  const fday = (firstThursday.getUTCDay() + 6) % 7;
+  firstThursday.setUTCDate(firstThursday.getUTCDate() - fday + 3);
+  const week = 1 + Math.round((dt - firstThursday) / (7 * 24 * 3600 * 1000));
+  return `${dt.getUTCFullYear()}-W${pad(week)}`;
+}
+
+// 模板表头指纹（sample_hash）：简单稳定字符串哈希
+function simpleHash(str) {
+  let h = 5381;
+  for (let i = 0; i < str.length; i++) h = ((h << 5) + h + str.charCodeAt(i)) >>> 0;
+  return 'h' + h.toString(16);
+}
+
+async function sha256Hex(buffer) {
+  const digest = await crypto.subtle.digest('SHA-256', buffer);
+  return Array.from(new Uint8Array(digest)).map(b => b.toString(16).padStart(2, '0')).join('');
+}
+
+// 费用确定性计算（导入缺费用列时使用，与模拟数据同一口径）：
+// 佣金 万2.5 最低5元；印花税 卖出 0.05%；过户费 0.001%（双向）
+function calcFee(direction, amount) {
+  const commission = Math.max(amount * 0.00025, 5);
+  const stamp = direction === 'sell' ? amount * 0.0005 : 0;
+  const transfer = amount * 0.00001;
+  return Math.round((commission + stamp + transfer) * 100) / 100;
+}
+
+// ---------- CSV / 文本解析共享工具（import.js 与 signal.js 同一实现，勿再复制） ----------
+
+// 轻量 CSV 解析（支持引号包裹、逗号转义、\r\n）
+function parseCSV(text) {
+  const rows = [];
+  let row = [], cur = '', inQ = false;
+  for (let i = 0; i < text.length; i++) {
+    const c = text[i];
+    if (inQ) {
+      if (c === '"') { if (text[i + 1] === '"') { cur += '"'; i++; } else inQ = false; }
+      else cur += c;
+    } else if (c === '"') inQ = true;
+    else if (c === ',') { row.push(cur); cur = ''; }
+    else if (c === '\n' || c === '\r') {
+      if (c === '\r' && text[i + 1] === '\n') i++;
+      row.push(cur); cur = '';
+      if (row.some(x => x.trim() !== '')) rows.push(row.map(x => x.trim()));
+      row = [];
+    } else cur += c;
+  }
+  row.push(cur);
+  if (row.some(x => x.trim() !== '')) rows.push(row.map(x => x.trim()));
+  return rows;
+}
+
+// 确定性伪随机数（固定种子，模拟数据/模拟信号评审可复现）
+function mulberry32(seed) {
+  return function () {
+    seed |= 0; seed = (seed + 0x6D2B79F5) | 0;
+    let t = Math.imul(seed ^ (seed >>> 15), 1 | seed);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
+// 方向归一化共享表（覆盖聚宽/掘金/QMT/券商交割单写法）
+const DIR_MAP = {
+  'buy': 'buy', 'b': 'buy', 'long': 'buy', '买入': 'buy', '买': 'buy', '多': 'buy', '开多': 'buy', '买开': 'buy', '23': 'buy',
+  'sell': 'sell', 's': 'sell', 'short': 'sell', '卖出': 'sell', '卖': 'sell', '空': 'sell', '开空': 'sell', '卖平': 'sell', '24': 'sell',
+  // 真实券商导出的方向用语（东财「操作」列=证券买入/证券卖出，华泰信用账户=担保品买入，
+  // 两融=融资买入/融券卖出，成交回报=买入成交）。全部精确匹配，不做模糊兜底。
+  '证券买入': 'buy', '担保品买入': 'buy', '融资买入': 'buy', '买入成交': 'buy', '买券还券': 'buy',
+  '证券卖出': 'sell', '担保品卖出': 'sell', '融券卖出': 'sell', '卖出成交': 'sell', '卖券还款': 'sell',
+};
+// 宽松归一化（信号导入用）：精确命中共享表，否则复合写法兜底（融资买入/卖出开仓 等）
+// 注意：交割单导入（import.js）只用 DIR_MAP 精确匹配，宽松兜底会吞掉脏数据，勿用
+function normDirection(s) {
+  const raw = String(s || '').trim().toLowerCase();
+  if (DIR_MAP[raw]) return DIR_MAP[raw];
+  const t = raw.replace(/融资|融券|担保|平仓|开仓|成交/g, '');
+  if (/^(买|多)/.test(t) || t.indexOf('买入') >= 0) return 'buy';
+  if (/^(卖|空)/.test(t) || t.indexOf('卖出') >= 0) return 'sell';
+  return null;
+}
+
+// 日期解析：2026-10-03 / 2026/10/03 / 2026年10月3日 / 20261003 → [年, 月-1, 日]
+function parseDatePart(s) {
+  const m = String(s || '').match(/(\d{4})\s*[-/年.]\s*(\d{1,2})\s*[-/月.]\s*(\d{1,2})/);
+  if (m) return [+m[1], +m[2] - 1, +m[3]];
+  const c = String(s || '').replace(/\D/g, '');
+  if (c.length === 8) return [+c.slice(0, 4), +c.slice(4, 6) - 1, +c.slice(6, 8)];
+  return null;
+}
+
+// 时间解析：09:35:21 / 09:35 / 093521 / 0935（QMT 常导纯数字）→ [时, 分, 秒]
+function parseTimePart(s) {
+  const t = String(s || '').trim();
+  if (/^\d{6}$/.test(t)) return [+t.slice(0, 2), +t.slice(2, 4), +t.slice(4, 6)];
+  if (/^\d{4}$/.test(t)) return [+t.slice(0, 2), +t.slice(2, 4), 0];
+  const m = t.match(/(\d{1,2}):(\d{1,2})(?::(\d{1,2}))?/);
+  if (!m) return null;
+  return [+m[1], +m[2], m[3] ? +m[3] : 0];
+}
+
+// [年,月-1,日] + [时,分,秒] → 秒级时间戳（本地时区）
+function toTs(d, t) {
+  return Math.floor(new Date(d[0], d[1], d[2], t[0], t[1], t[2]).getTime() / 1000);
+}
+
+// ---------- IndexedDB 持久化 ----------
+function idbOpen() {
+  return new Promise((res, rej) => {
+    const r = indexedDB.open(IDB_NAME, 1);
+    r.onupgradeneeded = () => r.result.createObjectStore(IDB_STORE);
+    r.onsuccess = () => res(r.result);
+    r.onerror = () => rej(r.error);
+  });
+}
+async function idbSet(k, v) {
+  const d = await idbOpen();
+  return new Promise((res, rej) => {
+    const tx = d.transaction(IDB_STORE, 'readwrite');
+    tx.objectStore(IDB_STORE).put(v, k);
+    tx.oncomplete = res;
+    tx.onerror = () => rej(tx.error);
+  });
+}
+async function idbGet(k) {
+  const d = await idbOpen();
+  return new Promise((res, rej) => {
+    const r = d.transaction(IDB_STORE, 'readonly').objectStore(IDB_STORE).get(k);
+    r.onsuccess = () => res(r.result);
+    r.onerror = () => rej(r.error);
+  });
+}
+
+// 变更后自动持久化（防抖 300ms）：sql.js export() 二进制 -> IndexedDB
+function scheduleSave() {
+  if (!db) return;
+  clearTimeout(saveTimer);
+  saveTimer = setTimeout(async () => {
+    try { await idbSet(DUMP_KEY, db.export()); } catch (e) { console.error('持久化失败', e); }
+  }, 300);
+}
+
+// 「导出 .sqlite 文件」按钮：浏览器下载当前数据库快照
+function exportSqliteFile() {
+  const data = db.export();
+  const blob = new Blob([data], { type: 'application/x-sqlite3' });
+  const a = document.createElement('a');
+  const d = new Date();
+  a.href = URL.createObjectURL(blob);
+  a.download = `复盘账本_${d.getFullYear()}${pad(d.getMonth() + 1)}${pad(d.getDate())}.sqlite`;
+  a.click();
+  URL.revokeObjectURL(a.href);
+}
+
+// ---------- SQL 便捷方法 ----------
+function q(sql, params = {}) {          // 查询 -> 对象数组
+  const stmt = db.prepare(sql);
+  stmt.bind(params);
+  const rows = [];
+  while (stmt.step()) rows.push(stmt.getAsObject());
+  stmt.free();
+  return rows;
+}
+function q1(sql, params = {}) { const r = q(sql, params); return r[0] || null; }
+function run(sql, params = {}) {        // 写操作 + 自动持久化
+  db.run(sql, params);
+  scheduleSave();
+}
+
+// ---------- DDL：逐字段拷贝自产品文档 §5（11 张表） ----------
+const DDL = `
+-- ========== 用户与订阅（本地最小集合） ==========
+CREATE TABLE IF NOT EXISTS users (
+    id              TEXT PRIMARY KEY,           -- 本地 UUID
+    phone_hash      TEXT,                       -- 手机号哈希（可空：纯本地模式）
+    nickname        TEXT,                       -- 昵称，默认「本地用户」
+    plan_tier       TEXT NOT NULL DEFAULT 'free',
+    plan_expire_at  INTEGER,
+    free_quota_used INTEGER NOT NULL DEFAULT 0,
+    quota_month     TEXT,
+    created_at      INTEGER NOT NULL,
+    updated_at      INTEGER NOT NULL
+);
+
+-- ========== 交割单导入中心 ==========
+CREATE TABLE IF NOT EXISTS broker_templates (
+    id              TEXT PRIMARY KEY,
+    broker_name     TEXT NOT NULL,              -- 券商名称，如「华泰证券」
+    source_type     TEXT NOT NULL,              -- excel / csv / ocr_image
+    version         INTEGER NOT NULL DEFAULT 1,
+    column_mapping  TEXT NOT NULL,              -- JSON：原始列名→标准字段 [确定性]
+    parse_rules     TEXT,                       -- JSON：清洗与校验规则 [确定性]
+    is_builtin      INTEGER NOT NULL DEFAULT 0, -- 1=官方内置；0=用户自定义（US-03）
+    sample_hash     TEXT,                       -- 表头哈希，自动命中指纹
+    created_at      INTEGER NOT NULL
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_broker_tpl ON broker_templates(broker_name, source_type, version);
+
+CREATE TABLE IF NOT EXISTS import_batches (
+    id              TEXT PRIMARY KEY,
+    user_id         TEXT NOT NULL REFERENCES users(id),
+    template_id     TEXT REFERENCES broker_templates(id),
+    source_type     TEXT NOT NULL,
+    file_name       TEXT NOT NULL,              -- [原始]
+    file_hash       TEXT NOT NULL,              -- 原文件 SHA256，防重复导入 [原始]
+    raw_file_path   TEXT NOT NULL,              -- 原文件本地留存路径 [原始]
+    total_rows      INTEGER,                    -- [确定性]
+    parsed_rows     INTEGER,                    -- [确定性]
+    failed_rows     INTEGER,                    -- [确定性]
+    parse_errors    TEXT,                       -- JSON：[{行号,原因}] [确定性]
+    ocr_raw_json    TEXT,                       -- [LLM 产出，本原型不使用]
+    status          TEXT NOT NULL DEFAULT 'done', -- done / partial / failed
+    created_at      INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_import_user ON import_batches(user_id, created_at);
+
+-- ========== 复盘账本 ==========
+CREATE TABLE IF NOT EXISTS trades (
+    id              TEXT PRIMARY KEY,
+    user_id         TEXT NOT NULL REFERENCES users(id),
+    import_batch_id TEXT NOT NULL REFERENCES import_batches(id),
+    source_row_no   INTEGER NOT NULL,           -- 原文件行号 [原始]
+    symbol          TEXT NOT NULL,              -- [确定性:解析]
+    symbol_name     TEXT,
+    direction       TEXT NOT NULL,              -- buy / sell [确定性:解析]
+    price           REAL NOT NULL,              -- [确定性:解析]
+    quantity        INTEGER NOT NULL,           -- [确定性:解析]
+    amount          REAL NOT NULL,              -- [确定性:解析]
+    fee             REAL NOT NULL DEFAULT 0,    -- 佣金+印花税+过户费 [确定性]
+    traded_at       INTEGER NOT NULL,           -- [确定性:解析]
+    market          TEXT,                       -- SH / SZ / BJ
+    is_margin       INTEGER NOT NULL DEFAULT 0,
+    note            TEXT,                       -- 用户笔记（人工）
+    tags            TEXT,                       -- JSON 数组：用户标签（人工）
+    pair_id         TEXT,                       -- FIFO 配对 ID [确定性]
+    is_t1_locked    INTEGER NOT NULL DEFAULT 0, -- T+1 当日买入锁定 [确定性]
+    created_at      INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_trades_user_symbol ON trades(user_id, symbol, traded_at);
+CREATE INDEX IF NOT EXISTS idx_trades_pair ON trades(pair_id);
+
+-- ========== 纪律系统 ==========
+CREATE TABLE IF NOT EXISTS trade_plans (
+    id              TEXT PRIMARY KEY,
+    user_id         TEXT NOT NULL REFERENCES users(id),
+    symbol          TEXT NOT NULL,
+    plan_window_start INTEGER NOT NULL,
+    plan_window_end   INTEGER NOT NULL,
+    checklist_json  TEXT NOT NULL,              -- {买入理由,止损位,目标仓位,持有周期假设}（人工）
+    status          TEXT NOT NULL DEFAULT 'open', -- open / executed / expired / cancelled [确定性]
+    matched_trade_id TEXT REFERENCES trades(id),  -- [确定性:标的+时间窗口匹配]
+    created_at      INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_plans_user ON trade_plans(user_id, status);
+
+CREATE TABLE IF NOT EXISTS discipline_rules (
+    id              TEXT PRIMARY KEY,
+    user_id         TEXT NOT NULL REFERENCES users(id),
+    rule_key        TEXT NOT NULL,              -- no_tail_chase / max_position_pct / stop_loss / t1_check / max_weekly_trades
+    rule_name       TEXT NOT NULL,
+    params_json     TEXT NOT NULL,              -- 规则参数（人工设定，模板预填）
+    is_builtin_tpl  INTEGER NOT NULL DEFAULT 0,
+    enabled         INTEGER NOT NULL DEFAULT 1,
+    created_at      INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_rules_user ON discipline_rules(user_id, enabled);
+
+CREATE TABLE IF NOT EXISTS rule_violations (
+    id              TEXT PRIMARY KEY,
+    user_id         TEXT NOT NULL REFERENCES users(id),
+    rule_id         TEXT NOT NULL REFERENCES discipline_rules(id),
+    trade_id        TEXT NOT NULL REFERENCES trades(id),
+    rule_snapshot   TEXT NOT NULL,              -- 判定时参数快照 [确定性:可复算]
+    evidence_json   TEXT NOT NULL,              -- 判定依据 [确定性:可回放]
+    violated_at     INTEGER NOT NULL,
+    created_at      INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_violations_user_rule ON rule_violations(user_id, rule_id, violated_at);
+
+CREATE TABLE IF NOT EXISTS metric_snapshots (
+    id              TEXT PRIMARY KEY,
+    user_id         TEXT NOT NULL REFERENCES users(id),
+    period          TEXT NOT NULL,              -- YYYY-MM / YYYY-Www
+    metric_key      TEXT NOT NULL,
+    metric_value    REAL NOT NULL,              -- [确定性:仅计算层写入]
+    calc_version    TEXT NOT NULL,
+    source_sql_hash TEXT,
+    created_at      INTEGER NOT NULL,
+    UNIQUE(user_id, period, metric_key, calc_version)
+);
+
+-- ========== 复盘报告（P1 预留，本原型仅建表） ==========
+CREATE TABLE IF NOT EXISTS review_reports (
+    id              TEXT PRIMARY KEY,
+    user_id         TEXT NOT NULL REFERENCES users(id),
+    period          TEXT NOT NULL,
+    total_trades    INTEGER,                    -- [确定性]
+    win_rate        REAL,                       -- [确定性]
+    profit_loss     REAL,                       -- [确定性]
+    discipline_score REAL,                      -- [确定性]
+    violations_top3 TEXT,                       -- [确定性]
+    mom_delta_json  TEXT,                       -- [确定性]
+    metrics_json    TEXT,                       -- [确定性]（LLM 的唯一输入）
+    report_text     TEXT,                       -- [LLM]
+    summary_text    TEXT,                       -- [LLM]
+    llm_model       TEXT,                       -- [LLM]
+    llm_prompt_ver  TEXT,                       -- [LLM]
+    compliance_scan TEXT,                       -- [确定性:词表匹配]
+    created_at      INTEGER NOT NULL,
+    UNIQUE(user_id, period)
+);
+
+-- ========== 信号 vs 成交三层对照（P1 预留，本原型仅建表） ==========
+CREATE TABLE IF NOT EXISTS signals (
+    id              TEXT PRIMARY KEY,
+    user_id         TEXT NOT NULL REFERENCES users(id),
+    import_batch_id TEXT REFERENCES import_batches(id),
+    platform        TEXT,                       -- joinquant / myquant / qmt / other（仅标注）
+    symbol          TEXT NOT NULL,
+    direction       TEXT NOT NULL,
+    signal_price    REAL,
+    signal_qty      INTEGER,
+    signaled_at     INTEGER NOT NULL,
+    strategy_name   TEXT,
+    backtest_ref    TEXT,
+    created_at      INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_signals_user ON signals(user_id, signaled_at);
+
+CREATE TABLE IF NOT EXISTS signal_fills (
+    id                  TEXT PRIMARY KEY,
+    user_id             TEXT NOT NULL REFERENCES users(id),
+    signal_id           TEXT REFERENCES signals(id),  -- NULL=extra（有成交但无信号）[确定性]
+    trade_id            TEXT REFERENCES trades(id),  -- NULL=漏跟单 [确定性]
+    match_status        TEXT NOT NULL,          -- filled / partial / missed / extra [确定性]
+    slippage            REAL,                   -- [确定性]
+    delay_seconds       INTEGER,                -- [确定性]
+    deviation_amount    REAL,                   -- [确定性]
+    match_rule_version  TEXT NOT NULL,          -- [确定性]
+    created_at          INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_fills_user ON signal_fills(user_id, match_status);
+`;
+
+const LOCAL_USER_ID = 'local-user';
+
+// 内置券商交割单模板（华泰 / 东财典型中文表头，column_mapping 按 DDL 设计）
+const BUILTIN_TEMPLATES = [
+  {
+    broker_name: '华泰证券',
+    headers: ['成交日期', '成交时间', '证券代码', '证券名称', '买卖方向', '成交价格', '成交数量', '成交金额', '佣金', '印花税', '过户费'],
+    mapping: { '成交日期': 'traded_date', '成交时间': 'traded_time', '证券代码': 'symbol', '证券名称': 'symbol_name', '买卖方向': 'direction', '成交价格': 'price', '成交数量': 'quantity', '成交金额': 'amount', '佣金': 'commission', '印花税': 'stamp_tax', '过户费': 'transfer_fee' },
+  },
+  {
+    broker_name: '东方财富证券',
+    headers: ['日期', '时间', '证券代码', '证券名称', '操作', '成交均价', '成交数量', '成交金额', '手续费', '印花税', '过户费'],
+    mapping: { '日期': 'traded_date', '时间': 'traded_time', '证券代码': 'symbol', '证券名称': 'symbol_name', '操作': 'direction', '成交均价': 'price', '成交数量': 'quantity', '成交金额': 'amount', '手续费': 'commission', '印花税': 'stamp_tax', '过户费': 'transfer_fee' },
+  },
+];
+
+// 内置纪律规则模板 ≥5 条（A 股特色，P0-M4）
+const BUILTIN_RULES = [
+  { rule_key: 'max_position_pct',  rule_name: '单票仓位 ≤30%',            params: { capital: 1000000, max_pct: 0.30 } },
+  { rule_key: 'stop_loss',         rule_name: '止损纪律：亏损 -7% 无条件执行', params: { max_loss_pct: 0.07 } },
+  { rule_key: 'no_tail_chase',     rule_name: '禁止 14:50 后尾盘追高买入',   params: { after: '14:50' } },
+  { rule_key: 't1_check',          rule_name: 'T+1：当日买入不可当日卖出',   params: {} },
+  { rule_key: 'max_weekly_trades', rule_name: '单周交易次数 ≤10 次',        params: { max: 10 } },
+];
+
+// ---------- 初始化：加载 sql.js -> 恢复/新建库 -> 建表 -> 播种 ----------
+async function initDB() {
+  const SQL = await initSqlJs({ locateFile: f => `${SQLJS_CDN}/${f}` });
+  const dump = await idbGet(DUMP_KEY);
+  db = dump ? new SQL.Database(new Uint8Array(dump)) : new SQL.Database();
+  db.exec(DDL);
+  seed();
+  scheduleSave();
+  return db;
+}
+
+function seed() {
+  const ts = now();
+  if (!q1('SELECT id FROM users WHERE id=$id', { $id: LOCAL_USER_ID })) {
+    run(`INSERT INTO users (id, nickname, plan_tier, created_at, updated_at)
+         VALUES ($id, '本地用户', 'free', $ts, $ts)`, { $id: LOCAL_USER_ID, $ts: ts });
+  }
+  for (const t of BUILTIN_TEMPLATES) {
+    const exists = q1('SELECT id FROM broker_templates WHERE broker_name=$n AND is_builtin=1', { $n: t.broker_name });
+    if (!exists) {
+      run(`INSERT INTO broker_templates (id, broker_name, source_type, version, column_mapping, parse_rules, is_builtin, sample_hash, created_at)
+           VALUES ($id, $n, 'csv', 1, $m, $p, 1, $h, $ts)`, {
+        $id: uuid(), $n: t.broker_name,
+        $m: JSON.stringify(t.mapping),
+        $p: JSON.stringify({ direction_map: DIR_MAP, amount_check: 'price*quantity≈amount' }),
+        $h: simpleHash(t.headers.join(',')),
+        $ts: ts,
+      });
+    }
+  }
+  for (const r of BUILTIN_RULES) {
+    const exists = q1('SELECT id FROM discipline_rules WHERE user_id=$u AND rule_key=$k', { $u: LOCAL_USER_ID, $k: r.rule_key });
+    if (!exists) {
+      run(`INSERT INTO discipline_rules (id, user_id, rule_key, rule_name, params_json, is_builtin_tpl, enabled, created_at)
+           VALUES ($id, $u, $k, $n, $p, 1, 1, $ts)`, {
+        $id: uuid(), $u: LOCAL_USER_ID, $k: r.rule_key, $n: r.rule_name, $p: JSON.stringify(r.params), $ts: ts,
+      });
+    }
+  }
+}
+
+
+// ============================================================
+// ===== 拼接文件 2/10：js/ui.js =====
+// ============================================================
+// ============================================================
+// ui.js — 共享 UI 原语（模态框骨架 / HTML 转义 / 通用渲染助手）
+// 提取自 ledger.js / analytics.js / signal.js / build_demo.py 导览框的重复骨架
+// ============================================================
+
+// HTML 转义：LLM 输出与用户输入插入 innerHTML 前必须过这道闸
+function esc(s) {
+  return String(s === null || s === undefined ? '' : s)
+    .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+}
+
+// 空态卡片（各列表页共用）
+function emptyState(text) {
+  return `<div class="bg-white rounded-xl border border-dashed border-slate-300 p-12 text-center text-slate-400 text-sm">${esc(text)}</div>`;
+}
+
+// 盈亏着色/文案（A股习惯：红涨绿跌）
+function pnlCls(v) { return v >= 0 ? 'text-red-600' : 'text-green-600'; }
+function pnlTxt(v) { return (v >= 0 ? '+' : '') + fmtMoney(v); }
+
+// 模态框骨架：统一遮罩/关闭按钮/点击遮罩关闭；bodyHTML 由调用方负责转义
+// opts: { title, titleExtra, bodyHTML, width }
+function openModal(opts) {
+  const root = document.getElementById('modal-root');
+  root.innerHTML = `
+  <div class="fixed inset-0 bg-black/40 flex items-center justify-center z-50 p-6" id="modal-mask">
+    <div class="bg-white rounded-2xl shadow-xl ${opts.width || 'max-w-4xl'} w-full max-h-[80vh] flex flex-col">
+      <div class="flex items-center px-6 py-4 border-b border-slate-100">
+        <h3 class="font-semibold">${opts.title}</h3>
+        ${opts.titleExtra ? `<span class="text-xs text-slate-400 ml-3">${opts.titleExtra}</span>` : ''}
+        <button id="modal-close" class="ml-auto text-slate-400 hover:text-slate-600 text-xl leading-none">×</button>
+      </div>
+      <div class="overflow-y-auto p-6">${opts.bodyHTML}</div>
+    </div>
+  </div>`;
+  const close = () => { root.innerHTML = ''; };
+  root.querySelector('#modal-close').onclick = close;
+  root.querySelector('#modal-mask').onclick = e => { if (e.target.id === 'modal-mask') close(); };
+  return root;
+}
+
+
+// ============================================================
+// ===== 拼接文件 3/10：js/ledger.js =====
+// ============================================================
+// ============================================================
+// ledger.js — 复盘账本（P0-M2）：流水视图 + FIFO 配对 + T+1 校验 + 笔记/标签
+// ============================================================
+
+// ---------- FIFO 配对（确定性，可复算） ----------
+// 规则：同一 symbol 按 traded_at 升序，买入入队，卖出从队首依次消耗；
+// 一笔卖单 + 其消耗的买单份额 = 一个「完整交易笔」（US-04）。
+// 返回 { closed: [...完整交易], open: [...未平仓买入], t1: [...当日买回卖违规对] }
+function computePairs(trades) {
+  const bySymbol = {};
+  for (const t of trades) (bySymbol[t.symbol] = bySymbol[t.symbol] || []).push(t);
+
+  const closed = [], open = [], t1 = [];
+  let pairSeq = 1;
+
+  for (const symbol of Object.keys(bySymbol)) {
+    const list = bySymbol[symbol].slice().sort((a, b) => a.traded_at - b.traded_at || a.source_row_no - b.source_row_no);
+    const queue = []; // {trade, remaining}
+    for (const t of list) {
+      if (t.direction === 'buy') {
+        queue.push({ trade: t, remaining: t.quantity });
+      } else {
+        let remaining = t.quantity;
+        const buyIds = [], fragBuys = [];
+        let cost = 0, earliestBuy = null;
+        while (remaining > 0 && queue.length > 0) {
+          const head = queue[0];
+          const take = Math.min(head.remaining, remaining);
+          // 费用按成交份额线性分摊（确定性）
+          cost += take * head.trade.price + head.trade.fee * (take / head.trade.quantity);
+          if (!earliestBuy) earliestBuy = head.trade;
+          if (dayKey(head.trade.traded_at) === dayKey(t.traded_at)) {
+            t1.push({ sellTrade: t, buyTrade: head.trade }); // T+1 硬规则违规线索
+          }
+          buyIds.push(head.trade.id);
+          fragBuys.push(head.trade);
+          head.remaining -= take;
+          remaining -= take;
+          if (head.remaining <= 0) queue.shift();
+        }
+        const proceeds = t.quantity * t.price - t.fee;
+        if (buyIds.length > 0) {
+          const closedQty = t.quantity - remaining;
+          const closedProceeds = proceeds * (closedQty / t.quantity);
+          const pnl = Math.round((closedProceeds - cost) * 100) / 100;
+          const tags = new Set();
+          for (const b of fragBuys) JSON.parse(b.tags || '[]').forEach(x => tags.add(x));
+          JSON.parse(t.tags || '[]').forEach(x => tags.add(x));
+          closed.push({
+            pairId: `P${String(pairSeq++).padStart(4, '0')}`,
+            symbol, symbolName: t.symbol_name || symbol,
+            qty: closedQty,
+            openAt: earliestBuy.traded_at,
+            closeAt: t.traded_at,
+            holdingDays: Math.round((t.traded_at - earliestBuy.traded_at) / 86400),
+            cost: Math.round(cost * 100) / 100,
+            proceeds: Math.round(closedProceeds * 100) / 100,
+            pnl,
+            ret: cost > 0 ? pnl / cost : 0,
+            buyTradeIds: buyIds,
+            sellTradeIds: [t.id],
+            sellTrade: t,
+            tags: Array.from(tags),
+          });
+        } else {
+          // 无持仓可卖：数据异常（超卖），记入异常台账
+          t1.push({ sellTrade: t, buyTrade: null });
+        }
+      }
+    }
+    for (const it of queue) open.push({ trade: it.trade, remaining: it.remaining });
+  }
+  closed.sort((a, b) => b.closeAt - a.closeAt);
+  return { closed, open, t1 };
+}
+
+// 配对结果回写 trades.pair_id / is_t1_locked（[确定性] 字段，仅计算层写入）
+function repairAll() {
+  const trades = q('SELECT * FROM trades WHERE user_id=$u', { $u: LOCAL_USER_ID });
+  const pairs = computePairs(trades);
+  const today = dayKey(now());
+  run('UPDATE trades SET pair_id=NULL, is_t1_locked=0 WHERE user_id=$u', { $u: LOCAL_USER_ID });
+  for (const c of pairs.closed) {
+    for (const id of [...c.buyTradeIds, ...c.sellTradeIds]) {
+      run('UPDATE trades SET pair_id=$p WHERE id=$id', { $p: c.pairId, $id: id });
+    }
+  }
+  for (const t of trades) {
+    if (t.direction === 'buy' && dayKey(t.traded_at) === today) {
+      run('UPDATE trades SET is_t1_locked=1 WHERE id=$id', { $id: t.id });
+    }
+  }
+  return pairs;
+}
+
+// ---------- 视图渲染 ----------
+let filter = { symbol: '', from: '', to: '', kw: '', tab: 'flow' };
+
+function renderLedger(el) {
+  const pairs = repairAll();
+  const symbols = q('SELECT DISTINCT symbol, symbol_name FROM trades WHERE user_id=$u ORDER BY symbol', { $u: LOCAL_USER_ID });
+
+  el.innerHTML = `
+  <div class="p-6 space-y-4">
+    <div class="flex flex-wrap items-end gap-3 bg-white rounded-xl border border-slate-200 p-4">
+      <label class="text-sm text-slate-600">股票分组
+        <select id="f-symbol" class="mt-1 block border rounded-lg px-2 py-1.5 text-sm">
+          <option value="">全部</option>
+          ${symbols.map(s => `<option value="${s.symbol}" ${filter.symbol === s.symbol ? 'selected' : ''}>${s.symbol} ${s.symbol_name || ''}</option>`).join('')}
+        </select></label>
+      <label class="text-sm text-slate-600">起始日期<input id="f-from" type="date" value="${filter.from}" class="mt-1 block border rounded-lg px-2 py-1.5 text-sm"></label>
+      <label class="text-sm text-slate-600">结束日期<input id="f-to" type="date" value="${filter.to}" class="mt-1 block border rounded-lg px-2 py-1.5 text-sm"></label>
+      <label class="text-sm text-slate-600">搜索<input id="f-kw" type="text" value="${filter.kw}" placeholder="代码 / 名称 / 笔记" class="mt-1 block border rounded-lg px-2 py-1.5 text-sm w-44"></label>
+      <div class="ml-auto flex gap-1 text-sm">
+        ${[['flow', '成交流水'], ['pairs', `完整交易(${pairs.closed.length})`], ['open', `未平仓(${pairs.open.length})`]].map(([k, label]) =>
+          `<button data-tab="${k}" class="tab-btn px-3 py-1.5 rounded-lg ${filter.tab === k ? 'bg-indigo-600 text-white' : 'bg-slate-100 text-slate-600 hover:bg-slate-200'}">${label}</button>`).join('')}
+      </div>
+    </div>
+    <div id="ledger-body"></div>
+  </div>`;
+
+  el.querySelector('#f-symbol').onchange = e => { filter.symbol = e.target.value; renderBody(); };
+  el.querySelector('#f-from').onchange = e => { filter.from = e.target.value; renderBody(); };
+  el.querySelector('#f-to').onchange = e => { filter.to = e.target.value; renderBody(); };
+  el.querySelector('#f-kw').oninput = e => { filter.kw = e.target.value.trim(); renderBody(); };
+  el.querySelectorAll('.tab-btn').forEach(b => b.onclick = () => { filter.tab = b.dataset.tab; renderLedger(el); });
+
+  function inRange(t) {
+    const d = fmtDate(t.traded_at);
+    if (filter.symbol && t.symbol !== filter.symbol) return false;
+    if (filter.from && d < filter.from) return false;
+    if (filter.to && d > filter.to) return false;
+    if (filter.kw) {
+      const kw = filter.kw.toLowerCase();
+      if (!(`${t.symbol}${t.symbol_name || ''}${t.note || ''}`.toLowerCase().includes(kw))) return false;
+    }
+    return true;
+  }
+
+  function renderBody() {
+    const body = el.querySelector('#ledger-body');
+    if (filter.tab === 'flow') return renderFlow(body);
+    if (filter.tab === 'pairs') return renderPairs(body);
+    return renderOpen(body);
+  }
+
+  function renderFlow(body) {
+    const rows = q(`SELECT t.*, b.file_name FROM trades t JOIN import_batches b ON b.id=t.import_batch_id
+                    WHERE t.user_id=$u ORDER BY t.traded_at DESC, t.source_row_no DESC`, { $u: LOCAL_USER_ID }).filter(inRange);
+    if (!rows.length) { body.innerHTML = emptyState('暂无成交记录，请先到「交割单导入」生成或导入数据'); return; }
+    body.innerHTML = `
+    <div class="bg-white rounded-xl border border-slate-200 overflow-x-auto">
+      <table class="min-w-full text-sm">
+        <thead class="bg-slate-50 text-slate-500 text-xs"><tr>
+          ${['日期', '时间', '代码', '名称', '方向', '价格', '数量', '金额', '费用', '配对', '标签', '笔记', '溯源', '操作'].map(h => `<th class="px-3 py-2 text-left font-medium">${h}</th>`).join('')}
+        </tr></thead>
+        <tbody>${rows.map(t => `
+          <tr class="border-t border-slate-100 hover:bg-slate-50">
+            <td class="px-3 py-2 whitespace-nowrap">${fmtDate(t.traded_at)}</td>
+            <td class="px-3 py-2">${fmtTime(t.traded_at)}</td>
+            <td class="px-3 py-2 font-mono">${esc(t.symbol)}</td>
+            <td class="px-3 py-2">${esc(t.symbol_name || '')}</td>
+            <td class="px-3 py-2">${t.direction === 'buy' ? '<span class="text-red-600 font-medium">买入</span>' : '<span class="text-green-600 font-medium">卖出</span>'}
+              ${t.is_t1_locked ? '<span class="ml-1 text-xs bg-amber-100 text-amber-700 rounded px-1">T+1锁定</span>' : ''}</td>
+            <td class="px-3 py-2 text-right">${fmtMoney(t.price)}</td>
+            <td class="px-3 py-2 text-right">${t.quantity}</td>
+            <td class="px-3 py-2 text-right">${fmtMoney(t.amount)}</td>
+            <td class="px-3 py-2 text-right">${fmtMoney(t.fee)}</td>
+            <td class="px-3 py-2 text-xs text-slate-400">${t.pair_id || '未平仓'}</td>
+            <td class="px-3 py-2">${JSON.parse(t.tags || '[]').map(x => `<span class="inline-block bg-indigo-50 text-indigo-600 rounded px-1.5 text-xs mr-1">${esc(x)}</span>`).join('')}</td>
+            <td class="px-3 py-2 text-xs text-slate-500 max-w-[10rem] truncate">${esc(t.note || '')}</td>
+            <td class="px-3 py-2 text-xs text-slate-400 whitespace-nowrap" title="溯源链：导入批次+原文件行号（§7.3）">${esc(t.file_name)} #${t.source_row_no}</td>
+            <td class="px-3 py-2"><button class="edit-btn text-indigo-600 hover:underline text-xs" data-id="${t.id}">笔记/标签</button></td>
+          </tr>`).join('')}
+        </tbody>
+      </table>
+    </div>`;
+    body.querySelectorAll('.edit-btn').forEach(b => b.onclick = () => openNoteEditor(b.dataset.id, renderBody));
+  }
+
+  function renderPairs(body) {
+    const list = pairs.closed.filter(c => {
+      const d = fmtDate(c.closeAt);
+      if (filter.symbol && c.symbol !== filter.symbol) return false;
+      if (filter.from && d < filter.from) return false;
+      if (filter.to && d > filter.to) return false;
+      if (filter.kw && !(`${c.symbol}${c.symbolName}`.includes(filter.kw))) return false;
+      return true;
+    });
+    if (!list.length) { body.innerHTML = emptyState('暂无已配对完成的交易'); return; }
+    body.innerHTML = `
+    <div class="bg-white rounded-xl border border-slate-200 overflow-x-auto">
+      <table class="min-w-full text-sm">
+        <thead class="bg-slate-50 text-slate-500 text-xs"><tr>
+          ${['配对号', '代码', '名称', '数量', '开仓日', '平仓日', '持仓天数', '成本(含费)', '卖出净额', '净盈亏', '收益率', '标签'].map(h => `<th class="px-3 py-2 text-left font-medium">${h}</th>`).join('')}
+        </tr></thead>
+        <tbody>${list.map(c => `
+          <tr class="border-t border-slate-100 hover:bg-slate-50">
+            <td class="px-3 py-2 text-xs text-slate-400">${c.pairId}</td>
+            <td class="px-3 py-2 font-mono">${esc(c.symbol)}</td>
+            <td class="px-3 py-2">${esc(c.symbolName)}</td>
+            <td class="px-3 py-2 text-right">${c.qty}</td>
+            <td class="px-3 py-2">${fmtDate(c.openAt)}</td>
+            <td class="px-3 py-2">${fmtDate(c.closeAt)}</td>
+            <td class="px-3 py-2 text-right">${c.holdingDays} 天</td>
+            <td class="px-3 py-2 text-right">${fmtMoney(c.cost)}</td>
+            <td class="px-3 py-2 text-right">${fmtMoney(c.proceeds)}</td>
+            <td class="px-3 py-2 text-right font-medium ${c.pnl >= 0 ? 'text-red-600' : 'text-green-600'}">${c.pnl >= 0 ? '+' : ''}${fmtMoney(c.pnl)}</td>
+            <td class="px-3 py-2 text-right ${c.ret >= 0 ? 'text-red-600' : 'text-green-600'}">${fmtPct(c.ret, 2)}</td>
+            <td class="px-3 py-2">${c.tags.map(x => `<span class="inline-block bg-indigo-50 text-indigo-600 rounded px-1.5 text-xs mr-1">${esc(x)}</span>`).join('')}</td>
+          </tr>`).join('')}
+        </tbody>
+      </table>
+    </div>`;
+  }
+
+  function renderOpen(body) {
+    if (!pairs.open.length) { body.innerHTML = emptyState('暂无未平仓持仓'); return; }
+    body.innerHTML = `
+    <div class="bg-white rounded-xl border border-slate-200 overflow-x-auto">
+      <table class="min-w-full text-sm">
+        <thead class="bg-slate-50 text-slate-500 text-xs"><tr>
+          ${['买入日期', '代码', '名称', '剩余数量', '买入价', '占用资金', '状态'].map(h => `<th class="px-3 py-2 text-left font-medium">${h}</th>`).join('')}
+        </tr></thead>
+        <tbody>${pairs.open.map(o => `
+          <tr class="border-t border-slate-100">
+            <td class="px-3 py-2">${fmtDateTime(o.trade.traded_at)}</td>
+            <td class="px-3 py-2 font-mono">${esc(o.trade.symbol)}</td>
+            <td class="px-3 py-2">${esc(o.trade.symbol_name || '')}</td>
+            <td class="px-3 py-2 text-right">${o.remaining}</td>
+            <td class="px-3 py-2 text-right">${fmtMoney(o.trade.price)}</td>
+            <td class="px-3 py-2 text-right">${fmtMoney(o.remaining * o.trade.price)}</td>
+            <td class="px-3 py-2">${dayKey(o.trade.traded_at) === dayKey(now()) ? '<span class="text-xs bg-amber-100 text-amber-700 rounded px-1.5 py-0.5">T+1 今日买入·明日可卖</span>' : '<span class="text-xs text-slate-400">可卖</span>'}</td>
+          </tr>`).join('')}
+        </tbody>
+      </table>
+    </div>`;
+  }
+
+  renderBody();
+}
+
+// ---------- 笔记 / 标签编辑器（人工字段，DDL 写入权限表允许用户写） ----------
+function openNoteEditor(tradeId, onSaved) {
+  const t = q1('SELECT * FROM trades WHERE id=$id', { $id: tradeId });
+  if (!t) return;
+  const tags = JSON.parse(t.tags || '[]');
+  const root = openModal({
+    title: '笔记与标签',
+    titleExtra: `${esc(t.symbol)} ${esc(t.symbol_name || '')} ${fmtDate(t.traded_at)}`,
+    width: 'max-w-md',
+    bodyHTML: `
+      <div class="space-y-4">
+        <label class="block text-sm text-slate-600">标签（逗号分隔，如：追涨,止损,计划内）
+          <input id="ne-tags" class="mt-1 w-full border rounded-lg px-3 py-2 text-sm" value="${esc(tags.join(','))}"></label>
+        <label class="block text-sm text-slate-600">复盘笔记
+          <textarea id="ne-note" rows="4" class="mt-1 w-full border rounded-lg px-3 py-2 text-sm" placeholder="这笔交易当时是怎么想的？">${esc(t.note || '')}</textarea></label>
+        <div class="flex justify-end gap-2">
+          <button id="ne-cancel" class="px-4 py-2 text-sm rounded-lg bg-slate-100 hover:bg-slate-200">取消</button>
+          <button id="ne-save" class="px-4 py-2 text-sm rounded-lg bg-indigo-600 text-white hover:bg-indigo-700">保存</button>
+        </div>
+      </div>`,
+  });
+  root.querySelector('#ne-cancel').onclick = () => root.innerHTML = '';
+  root.querySelector('#ne-save').onclick = () => {
+    const tagArr = root.querySelector('#ne-tags').value.split(/[,，]/).map(s => s.trim()).filter(Boolean);
+    run('UPDATE trades SET tags=$t, note=$n WHERE id=$id', {
+      $t: JSON.stringify(tagArr), $n: root.querySelector('#ne-note').value.trim(), $id: tradeId,
+    });
+    root.innerHTML = '';
+    onSaved && onSaved();
+  };
+}
+
+
+// ============================================================
+// ===== 拼接文件 4/10：js/discipline.js =====
+// ============================================================
+// ============================================================
+// discipline.js — 纪律系统（P0-M4）
+// 交易前计划 / 规则模板 / 违规自动标记 / 纪律执行率（对标 Edgewonk Tiltmeter）
+// 判定 100% 确定性、可复算、可回放（rule_snapshot + evidence_json）
+// ============================================================
+
+// ---------- 规则引擎：全量重跑（确定性，可回放） ----------
+function runRuleEngine() {
+  const rules = q('SELECT * FROM discipline_rules WHERE user_id=$u AND enabled=1', { $u: LOCAL_USER_ID });
+  const trades = q('SELECT * FROM trades WHERE user_id=$u ORDER BY traded_at, source_row_no', { $u: LOCAL_USER_ID });
+  run('DELETE FROM rule_violations WHERE user_id=$u', { $u: LOCAL_USER_ID });
+  if (!trades.length) return;
+
+  const pairs = computePairs(trades);
+  const add = (rule, trade, evidence, violatedAt) => {
+    run(`INSERT INTO rule_violations (id, user_id, rule_id, trade_id, rule_snapshot, evidence_json, violated_at, created_at)
+         VALUES ($id, $u, $rid, $tid, $snap, $ev, $va, $ts)`, {
+      $id: uuid(), $u: LOCAL_USER_ID, $rid: rule.id, $tid: trade.id,
+      $snap: rule.params_json, $ev: JSON.stringify(evidence), $va: violatedAt, $ts: now(),
+    });
+  };
+
+  for (const rule of rules) {
+    const p = JSON.parse(rule.params_json || '{}');
+    switch (rule.rule_key) {
+      // ① 单票仓位上限：单笔买入金额 > 本金 × max_pct
+      case 'max_position_pct': {
+        const limit = (p.capital || 0) * (p.max_pct || 1);
+        for (const t of trades) {
+          if (t.direction === 'buy' && t.amount > limit) {
+            add(rule, t, { 买入金额: t.amount, 仓位上限: limit, 假设本金: p.capital, 超限金额: Math.round((t.amount - limit) * 100) / 100 }, t.traded_at);
+          }
+        }
+        break;
+      }
+      // ② 止损纪律：完整交易收益率 < -max_loss_pct（说明 -7% 未执行止损）
+      case 'stop_loss': {
+        for (const c of pairs.closed) {
+          if (c.ret < -(p.max_loss_pct || 0.07)) {
+            add(rule, c.sellTrade, { 标的: c.symbol, 持仓成本: c.cost, 卖出净额: c.proceeds, 收益率: fmtPct(c.ret, 2), 止损线: fmtPct(-(p.max_loss_pct || 0.07), 0) }, c.closeAt);
+          }
+        }
+        break;
+      }
+      // ③ 尾盘追高：买入时间 ≥ after（默认 14:50）
+      case 'no_tail_chase': {
+        const [hh, mm] = (p.after || '14:50').split(':').map(Number);
+        for (const t of trades) {
+          if (t.direction !== 'buy') continue;
+          const d = new Date(t.traded_at * 1000);
+          if (d.getHours() * 60 + d.getMinutes() >= hh * 60 + mm) {
+            add(rule, t, { 买入时间: fmtTime(t.traded_at), 红线: p.after, 买入金额: t.amount }, t.traded_at);
+          }
+        }
+        break;
+      }
+      // ④ T+1 硬规则：卖出与所消耗买入同日（A股制度红线）
+      case 't1_check': {
+        for (const v of pairs.t1) {
+          if (!v.buyTrade) continue; // 超卖异常另行标记
+          add(rule, v.sellTrade, { 卖出日: fmtDate(v.sellTrade.traded_at), 对应买入日: fmtDate(v.buyTrade.traded_at), 说明: '当日买入当日卖出，违反T+1' }, v.sellTrade.traded_at);
+        }
+        break;
+      }
+      // ⑤ 单周交易次数上限：同一 ISO 周内第 N+1 笔起逐笔记违规（防过度交易）
+      case 'max_weekly_trades': {
+        const max = p.max || 10;
+        const byWeek = {};
+        for (const t of trades) (byWeek[weekKey(t.traded_at)] = byWeek[weekKey(t.traded_at)] || []).push(t);
+        for (const wk of Object.keys(byWeek)) {
+          const list = byWeek[wk];
+          if (list.length > max) {
+            list.slice(max).forEach((t, i) => add(rule, t, { 周: wk, 当周第几笔: max + 1 + i, 上限: max }, t.traded_at));
+          }
+        }
+        break;
+      }
+    }
+  }
+}
+
+// 纪律执行率 = 1 - 违规笔数/总交易笔数（违规笔数按去重交易计）
+function disciplineScore() {
+  const total = q1('SELECT COUNT(*) c FROM trades WHERE user_id=$u', { $u: LOCAL_USER_ID }).c;
+  const violated = q1('SELECT COUNT(DISTINCT trade_id) c FROM rule_violations WHERE user_id=$u', { $u: LOCAL_USER_ID }).c;
+  return { total, violated, score: total ? 1 - violated / total : null };
+}
+
+// ---------- 交易前计划：确定性匹配（标的+时间窗口，不由 LLM 判定） ----------
+function reMatchPlans() {
+  const plans = q('SELECT * FROM trade_plans WHERE user_id=$u', { $u: LOCAL_USER_ID });
+  for (const p of plans) {
+    const m = q1(`SELECT id FROM trades WHERE user_id=$u AND symbol=$s AND direction='buy'
+                  AND traded_at BETWEEN $a AND $b ORDER BY traded_at LIMIT 1`,
+      { $u: LOCAL_USER_ID, $s: p.symbol, $a: p.plan_window_start, $b: p.plan_window_end });
+    const expired = !m && p.plan_window_end < now();
+    run('UPDATE trade_plans SET status=$st, matched_trade_id=$mt WHERE id=$id', {
+      $st: m ? 'executed' : (expired ? 'expired' : 'open'),
+      $mt: m ? m.id : null, $id: p.id,
+    });
+  }
+}
+
+// ---------- 纪律系统视图（含执行率仪表盘） ----------
+let dTab = 'overview';
+function renderDiscipline(el) {
+  const { total, violated, score } = disciplineScore();
+  const rules = q('SELECT * FROM discipline_rules WHERE user_id=$u ORDER BY created_at', { $u: LOCAL_USER_ID });
+  const violations = q(`SELECT v.*, r.rule_name, r.rule_key, t.symbol, t.symbol_name, t.direction, t.price, t.quantity, t.amount, t.traded_at
+                        FROM rule_violations v JOIN discipline_rules r ON r.id=v.rule_id JOIN trades t ON t.id=v.trade_id
+                        WHERE v.user_id=$u ORDER BY v.violated_at DESC`, { $u: LOCAL_USER_ID });
+
+  // 月度执行率趋势：每月交易笔数 vs 违规去重笔数
+  const months = {};
+  for (const t of q('SELECT traded_at FROM trades WHERE user_id=$u', { $u: LOCAL_USER_ID })) {
+    const k = monthKey(t.traded_at); (months[k] = months[k] || { total: 0, violated: 0 }).total++;
+  }
+  for (const v of q('SELECT violated_at, trade_id FROM rule_violations WHERE user_id=$u', { $u: LOCAL_USER_ID })) {
+    const k = monthKey(v.violated_at);
+    if (months[k]) { months[k]._set = months[k]._set || new Set(); months[k]._set.add(v.trade_id); }
+  }
+  const monthList = Object.keys(months).sort().map(k => {
+    const m = months[k];
+    const v = m._set ? m._set.size : 0;
+    return { month: k, rate: m.total ? 1 - v / m.total : 1, total: m.total, violated: v };
+  });
+
+  // 按规则违规频次排名
+  const byRule = {};
+  for (const v of violations) byRule[v.rule_name] = (byRule[v.rule_name] || 0) + 1;
+  const ruleRank = Object.entries(byRule).sort((a, b) => b[1] - a[1]);
+  const maxCnt = ruleRank.length ? ruleRank[0][1] : 1;
+
+  el.innerHTML = `
+  <div class="p-6 space-y-6">
+    <div class="grid grid-cols-1 lg:grid-cols-3 gap-4">
+      <div class="bg-white rounded-xl border border-slate-200 p-6 text-center">
+        <div class="text-sm text-slate-500 mb-1">纪律执行率</div>
+        <div class="text-5xl font-bold ${score === null ? 'text-slate-300' : score >= 0.9 ? 'text-emerald-600' : score >= 0.75 ? 'text-amber-500' : 'text-red-500'}">${score === null ? '—' : fmtPct(score)}</div>
+        <div class="text-xs text-slate-400 mt-2">1 − 违规笔数(${violated}) / 总交易笔数(${total})</div>
+      </div>
+      <div class="bg-white rounded-xl border border-slate-200 p-5">
+        <div class="text-sm text-slate-500 mb-3">月度执行率趋势</div>
+        ${monthList.length ? `<div class="flex items-end gap-3 h-28">${monthList.map(m => `
+          <div class="flex-1 flex flex-col items-center gap-1">
+            <div class="text-xs font-medium ${m.rate >= 0.9 ? 'text-emerald-600' : m.rate >= 0.75 ? 'text-amber-500' : 'text-red-500'}">${fmtPct(m.rate, 0)}</div>
+            <div class="w-full rounded-t ${m.rate >= 0.9 ? 'bg-emerald-400' : m.rate >= 0.75 ? 'bg-amber-400' : 'bg-red-400'}" style="height:${Math.max(6, m.rate * 72)}px"></div>
+            <div class="text-xs text-slate-400">${m.month.slice(5)}月</div>
+          </div>`).join('')}</div>` : '<div class="text-slate-300 text-sm">暂无数据</div>'}
+      </div>
+      <div class="bg-white rounded-xl border border-slate-200 p-5">
+        <div class="text-sm text-slate-500 mb-3">违规频次排名（按规则）</div>
+        ${ruleRank.length ? ruleRank.map(([name, cnt]) => `
+          <div class="mb-2"><div class="flex justify-between text-xs mb-0.5"><span>${name}</span><span class="text-red-500 font-medium">${cnt} 次</span></div>
+          <div class="h-2 bg-slate-100 rounded"><div class="h-2 bg-red-400 rounded" style="width:${cnt / maxCnt * 100}%"></div></div></div>`).join('')
+        : '<div class="text-slate-300 text-sm">暂无违规，继续保持</div>'}
+      </div>
+    </div>
+
+    <div class="flex gap-1 text-sm">
+      ${[['overview', `违规记录(${violations.length})`], ['rules', `规则管理(${rules.filter(r => r.enabled).length}/${rules.length}启用)`]].map(([k, label]) =>
+        `<button data-dtab="${k}" class="px-3 py-1.5 rounded-lg ${dTab === k ? 'bg-indigo-600 text-white' : 'bg-white border border-slate-200 text-slate-600 hover:bg-slate-50'}">${label}</button>`).join('')}
+    </div>
+    <div id="d-body"></div>
+  </div>`;
+
+  el.querySelectorAll('[data-dtab]').forEach(b => b.onclick = () => { dTab = b.dataset.dtab; renderDiscipline(el); });
+  const body = el.querySelector('#d-body');
+
+  if (dTab === 'overview') {
+    body.innerHTML = violations.length ? `
+    <div class="bg-white rounded-xl border border-slate-200 overflow-x-auto">
+      <table class="min-w-full text-sm">
+        <thead class="bg-slate-50 text-slate-500 text-xs"><tr>
+          ${['违规时间', '规则', '标的', '方向', '金额', '判定依据快照（可回放）'].map(h => `<th class="px-4 py-2 text-left font-medium">${h}</th>`).join('')}
+        </tr></thead>
+        <tbody>${violations.map(v => `<tr class="border-t border-slate-100 hover:bg-slate-50">
+          <td class="px-4 py-2 whitespace-nowrap">${fmtDateTime(v.violated_at)}</td>
+          <td class="px-4 py-2"><span class="text-xs bg-red-50 text-red-600 rounded px-1.5 py-0.5">${v.rule_name}</span></td>
+          <td class="px-4 py-2 font-mono text-xs">${v.symbol} ${v.symbol_name || ''}</td>
+          <td class="px-4 py-2">${v.direction === 'buy' ? '<span class="text-red-600">买入</span>' : '<span class="text-green-600">卖出</span>'}</td>
+          <td class="px-4 py-2 text-right">${fmtMoney(v.amount)}</td>
+          <td class="px-4 py-2 text-xs text-slate-500 font-mono">${v.evidence_json}</td>
+        </tr>`).join('')}</tbody>
+      </table>
+    </div>` : '<div class="bg-white rounded-xl border border-dashed border-slate-300 p-12 text-center text-slate-400 text-sm">暂无违规记录</div>';
+  } else {
+    body.innerHTML = `
+    <div class="space-y-3">${rules.map(r => {
+      const p = JSON.parse(r.params_json || '{}');
+      return `
+      <div class="bg-white rounded-xl border border-slate-200 p-4 flex flex-wrap items-center gap-4">
+        <label class="flex items-center gap-2 cursor-pointer">
+          <input type="checkbox" class="rule-toggle w-4 h-4" data-id="${r.id}" ${r.enabled ? 'checked' : ''}>
+          <span class="font-medium text-sm">${r.rule_name}</span>
+          ${r.is_builtin_tpl ? '<span class="text-xs bg-emerald-50 text-emerald-600 rounded px-1.5 py-0.5">内置A股模板</span>' : ''}
+        </label>
+        <div class="flex items-center gap-2 text-xs text-slate-500 ml-auto">
+          ${r.rule_key === 'max_position_pct' ? `假设本金 <input class="param-in w-24 border rounded px-1.5 py-1" data-id="${r.id}" data-key="capital" value="${p.capital}"> 元，上限 <input class="param-in w-16 border rounded px-1.5 py-1" data-id="${r.id}" data-key="max_pct" value="${p.max_pct}">（0.30=30%）` : ''}
+          ${r.rule_key === 'stop_loss' ? `止损线 -<input class="param-in w-16 border rounded px-1.5 py-1" data-id="${r.id}" data-key="max_loss_pct" value="${p.max_loss_pct}">（0.07=7%）` : ''}
+          ${r.rule_key === 'no_tail_chase' ? `红线时间 <input class="param-in w-20 border rounded px-1.5 py-1" data-id="${r.id}" data-key="after" value="${p.after}">` : ''}
+          ${r.rule_key === 't1_check' ? '<span class="text-slate-400">无参数（制度硬规则）</span>' : ''}
+          ${r.rule_key === 'max_weekly_trades' ? `单周上限 <input class="param-in w-14 border rounded px-1.5 py-1" data-id="${r.id}" data-key="max" value="${p.max}"> 笔` : ''}
+        </div>
+      </div>`;
+    }).join('')}
+    <p class="text-xs text-slate-400">修改参数或启停后立即全量重跑规则引擎（确定性、可回放）。</p>
+    </div>`;
+
+    body.querySelectorAll('.rule-toggle').forEach(cb => cb.onchange = () => {
+      run('UPDATE discipline_rules SET enabled=$e WHERE id=$id', { $e: cb.checked ? 1 : 0, $id: cb.dataset.id });
+      runRuleEngine(); renderDiscipline(el);
+    });
+    body.querySelectorAll('.param-in').forEach(inp => inp.onchange = () => {
+      const r = q1('SELECT * FROM discipline_rules WHERE id=$id', { $id: inp.dataset.id });
+      const p = JSON.parse(r.params_json || '{}');
+      const v = inp.dataset.key === 'after' ? inp.value : parseFloat(inp.value);
+      if (inp.dataset.key !== 'after' && !(v >= 0)) return;
+      p[inp.dataset.key] = v;
+      run('UPDATE discipline_rules SET params_json=$p WHERE id=$id', { $p: JSON.stringify(p), $id: inp.dataset.id });
+      runRuleEngine(); renderDiscipline(el);
+    });
+  }
+}
+
+// ---------- 交易前计划视图 ----------
+function renderPlans(el) {
+  reMatchPlans();
+  const plans = q('SELECT * FROM trade_plans WHERE user_id=$u ORDER BY created_at DESC', { $u: LOCAL_USER_ID });
+  const symbols = q('SELECT DISTINCT symbol, symbol_name FROM trades WHERE user_id=$u ORDER BY symbol', { $u: LOCAL_USER_ID });
+  // 计划外交易：无计划匹配的买入（确定性：标的+时间窗口）
+  const buys = q(`SELECT * FROM trades WHERE user_id=$u AND direction='buy' ORDER BY traded_at DESC`, { $u: LOCAL_USER_ID });
+  const plannedIds = new Set(plans.filter(p => p.matched_trade_id).map(p => p.matched_trade_id));
+  const planList = q('SELECT * FROM trade_plans WHERE user_id=$u AND status != $c', { $u: LOCAL_USER_ID, $c: 'cancelled' });
+  const outOfPlan = buys.filter(t => {
+    if (plannedIds.has(t.id)) return false;
+    return !planList.some(p => p.symbol === t.symbol && t.traded_at >= p.plan_window_start && t.traded_at <= p.plan_window_end);
+  });
+
+  const STATUS = { open: ['进行中', 'bg-blue-50 text-blue-600'], executed: ['已执行', 'bg-emerald-50 text-emerald-600'], expired: ['已过期', 'bg-slate-100 text-slate-500'] };
+
+  el.innerHTML = `
+  <div class="p-6 space-y-6">
+    <div class="grid grid-cols-1 lg:grid-cols-3 gap-4">
+      <div class="bg-white rounded-xl border border-slate-200 p-5 lg:col-span-1">
+        <h3 class="font-semibold mb-3">新建交易计划（买入前必填）</h3>
+        <div class="space-y-3 text-sm">
+          <label class="block text-slate-600">标的代码
+            <input id="pl-symbol" list="pl-symbols" class="mt-1 w-full border rounded-lg px-3 py-2" placeholder="如 600519">
+            <datalist id="pl-symbols">${symbols.map(s => `<option value="${s.symbol}">${s.symbol_name || ''}</option>`).join('')}</datalist></label>
+          <div class="grid grid-cols-2 gap-2">
+            <label class="text-slate-600">窗口起<input id="pl-start" type="date" class="mt-1 w-full border rounded-lg px-2 py-2"></label>
+            <label class="text-slate-600">窗口止<input id="pl-end" type="date" class="mt-1 w-full border rounded-lg px-2 py-2"></label>
+          </div>
+          <div class="grid grid-cols-3 gap-2">
+            <label class="text-slate-600">计划买入价<input id="pl-price" type="number" step="0.01" class="mt-1 w-full border rounded-lg px-2 py-2"></label>
+            <label class="text-slate-600">止损价<input id="pl-stop" type="number" step="0.01" class="mt-1 w-full border rounded-lg px-2 py-2"></label>
+            <label class="text-slate-600">目标价<input id="pl-target" type="number" step="0.01" class="mt-1 w-full border rounded-lg px-2 py-2"></label>
+          </div>
+          <label class="block text-slate-600">计划仓位（%）<input id="pl-pos" type="number" min="1" max="100" class="mt-1 w-full border rounded-lg px-3 py-2" placeholder="如 20"></label>
+          <label class="block text-slate-600">买入理由 / 持有假设<textarea id="pl-reason" rows="2" class="mt-1 w-full border rounded-lg px-3 py-2" placeholder="为什么买？打算拿多久？"></textarea></label>
+          <button id="pl-save" class="w-full py-2 bg-indigo-600 text-white rounded-lg hover:bg-indigo-700">保存计划</button>
+        </div>
+      </div>
+      <div class="lg:col-span-2 space-y-4">
+        <div class="bg-white rounded-xl border border-slate-200">
+          <h3 class="font-semibold px-5 pt-4 pb-2">计划清单（${plans.length}）</h3>
+          <div class="overflow-x-auto"><table class="min-w-full text-sm">
+            <thead class="bg-slate-50 text-slate-500 text-xs"><tr>${['标的', '窗口', '买入价/止损/目标', '仓位', '理由', '状态'].map(h => `<th class="px-4 py-2 text-left font-medium">${h}</th>`).join('')}</tr></thead>
+            <tbody>${plans.length ? plans.map(p => {
+              const c = JSON.parse(p.checklist_json || '{}');
+              return `<tr class="border-t border-slate-100">
+                <td class="px-4 py-2 font-mono text-xs">${p.symbol}</td>
+                <td class="px-4 py-2 text-xs whitespace-nowrap">${fmtDate(p.plan_window_start)} ~ ${fmtDate(p.plan_window_end)}</td>
+                <td class="px-4 py-2 text-xs">${c.plan_price || '-'} / ${c.stop_price || '-'} / ${c.target_price || '-'}</td>
+                <td class="px-4 py-2 text-xs">${c.position_pct ? c.position_pct + '%' : '-'}</td>
+                <td class="px-4 py-2 text-xs text-slate-500 max-w-[12rem] truncate" title="${c.reason || ''}">${c.reason || ''}</td>
+                <td class="px-4 py-2"><span class="text-xs rounded px-1.5 py-0.5 ${(STATUS[p.status] || STATUS.open)[1]}">${(STATUS[p.status] || STATUS.open)[0]}</span></td>
+              </tr>`;
+            }).join('') : '<tr><td colspan="6" class="px-4 py-8 text-center text-slate-400">暂无计划</td></tr>'}</tbody>
+          </table></div>
+        </div>
+        <div class="bg-white rounded-xl border border-amber-200">
+          <h3 class="font-semibold px-5 pt-4 pb-2 text-amber-700">计划外交易（${outOfPlan.length} 笔买入无对应计划，US-06 自动标记）</h3>
+          <div class="overflow-x-auto"><table class="min-w-full text-sm">
+            <thead class="bg-amber-50 text-amber-600 text-xs"><tr>${['时间', '标的', '价格', '数量', '金额'].map(h => `<th class="px-4 py-2 text-left font-medium">${h}</th>`).join('')}</tr></thead>
+            <tbody>${outOfPlan.slice(0, 20).map(t => `<tr class="border-t border-amber-100">
+              <td class="px-4 py-2 whitespace-nowrap">${fmtDateTime(t.traded_at)}</td>
+              <td class="px-4 py-2 font-mono text-xs">${t.symbol} ${t.symbol_name || ''}</td>
+              <td class="px-4 py-2 text-right">${fmtMoney(t.price)}</td>
+              <td class="px-4 py-2 text-right">${t.quantity}</td>
+              <td class="px-4 py-2 text-right">${fmtMoney(t.amount)}</td>
+            </tr>`).join('') || '<tr><td colspan="5" class="px-4 py-6 text-center text-slate-400">全部买入均有计划，纪律优秀</td></tr>'}</tbody>
+          </table></div>
+        </div>
+      </div>
+    </div>
+  </div>`;
+
+  el.querySelector('#pl-save').onclick = () => {
+    const symbol = el.querySelector('#pl-symbol').value.trim();
+    const start = el.querySelector('#pl-start').value, end = el.querySelector('#pl-end').value;
+    if (!/^\d{6}$/.test(symbol)) { alert('请填写 6 位标的代码'); return; }
+    if (!start || !end || end < start) { alert('请选择有效的计划窗口'); return; }
+    const checklist = {
+      plan_price: parseFloat(el.querySelector('#pl-price').value) || null,
+      stop_price: parseFloat(el.querySelector('#pl-stop').value) || null,
+      target_price: parseFloat(el.querySelector('#pl-target').value) || null,
+      position_pct: parseFloat(el.querySelector('#pl-pos').value) || null,
+      reason: el.querySelector('#pl-reason').value.trim(),
+    };
+    run(`INSERT INTO trade_plans (id, user_id, symbol, plan_window_start, plan_window_end, checklist_json, status, created_at)
+         VALUES ($id, $u, $s, $a, $b, $c, 'open', $ts)`, {
+      $id: uuid(), $u: LOCAL_USER_ID, $s: symbol,
+      $a: Math.floor(new Date(start + 'T00:00:00').getTime() / 1000),
+      $b: Math.floor(new Date(end + 'T23:59:59').getTime() / 1000),
+      $c: JSON.stringify(checklist), $ts: now(),
+    });
+    renderPlans(el);
+  };
+}
+
+
+// ============================================================
+// ===== 拼接文件 5/10：js/import.js =====
+// ============================================================
+// ============================================================
+// import.js — 交割单导入中心（P0-M1）
+// 三条路径：内置券商模板自动命中 / 通用 CSV 自定义映射 / 模拟数据一键生成
+// ============================================================
+
+// 标准字段定义（通用映射工具下拉选项）
+const STD_FIELDS = [
+  ['', '— 忽略该列 —'],
+  ['traded_date', '成交日期（必填）'], ['traded_time', '成交时间'],
+  ['symbol', '证券代码（必填）'], ['symbol_name', '证券名称'],
+  ['direction', '买卖方向（必填）'], ['price', '成交价格（必填）'],
+  ['quantity', '成交数量（必填）'], ['amount', '成交金额（必填）'],
+  ['commission', '佣金/手续费'], ['stamp_tax', '印花税'], ['transfer_fee', '过户费'],
+];
+// 交割单方向只做精确匹配（脏数据直接拒绝）；宽松兜底归一化见 db.js normDirection（信号导入专用）
+const DIRECTION_MAP = DIR_MAP;
+
+// ---------- 编码兼容：UTF-8 严格解码失败则 GBK 兜底（券商导出常见 GBK） ----------
+function decodeBuffer(buf) {
+  try { return new TextDecoder('utf-8', { fatal: true }).decode(buf); }
+  catch (e) { return new TextDecoder('gbk').decode(buf); }
+}
+
+// 交割单日期时间 → 秒级时间戳；时间可空（默认 10:00）
+function parseDateTime(dateStr, timeStr) {
+  const d = parseDatePart(dateStr);
+  if (!d) return null;
+  const t = parseTimePart(timeStr || '10:00') || [10, 0, 0];
+  return toTs(d, t);
+}
+
+function marketOf(symbol) {
+  if (symbol.startsWith('6')) return 'SH';
+  if (symbol.startsWith('8') || symbol.startsWith('4')) return 'BJ';
+  return 'SZ';
+}
+
+// ---------- 视图 ----------
+function renderImport(el) {
+  const templates = q('SELECT * FROM broker_templates ORDER BY is_builtin DESC, created_at');
+  const batches = q('SELECT b.*, t.broker_name FROM import_batches b LEFT JOIN broker_templates t ON t.id=b.template_id WHERE b.user_id=$u ORDER BY b.created_at DESC', { $u: LOCAL_USER_ID });
+  const tradeCount = q1('SELECT COUNT(*) c FROM trades WHERE user_id=$u', { $u: LOCAL_USER_ID }).c;
+
+  el.innerHTML = `
+  <div class="p-6 space-y-6">
+    <div class="grid grid-cols-1 lg:grid-cols-3 gap-4">
+      <div class="bg-white rounded-xl border border-slate-200 p-5">
+        <h3 class="font-semibold mb-1">上传交割单 CSV</h3>
+        <p class="text-xs text-slate-500 mb-3">自动按表头指纹命中内置/自定义模板；未命中则进入列映射工具。GBK 编码自动兼容。</p>
+        <input type="file" id="csv-file" accept=".csv,.txt" class="block w-full text-sm text-slate-600 file:mr-3 file:py-2 file:px-4 file:rounded-lg file:border-0 file:bg-indigo-600 file:text-white hover:file:bg-indigo-700">
+        <div class="mt-3 flex gap-2">
+          <button id="dl-ht" class="text-xs text-indigo-600 hover:underline">下载华泰样例CSV</button>
+          <button id="dl-df" class="text-xs text-indigo-600 hover:underline">下载东财样例CSV</button>
+        </div>
+      </div>
+      <div class="bg-gradient-to-br from-indigo-600 to-violet-600 rounded-xl p-5 text-white">
+        <h3 class="font-semibold mb-1">一键生成模拟数据</h3>
+        <p class="text-xs text-indigo-100 mb-3">3 个月约 60 笔、10 只 A 股真实代码；费用按「佣金万2.5最低5元 / 印花税0.05% / 过户费0.001%」确定性计算；故意埋入尾盘追高、超仓位等违规，方便评审看纪律系统效果。</p>
+        <button id="gen-mock" class="px-4 py-2 bg-white text-indigo-700 rounded-lg text-sm font-medium hover:bg-indigo-50">生成 3 个月模拟交割单</button>
+        <p class="text-xs text-indigo-200 mt-2">当前账本已有 ${tradeCount} 笔成交</p>
+      </div>
+      <div class="bg-white rounded-xl border border-slate-200 p-5">
+        <h3 class="font-semibold mb-2">模板库（${templates.length}）</h3>
+        <ul class="text-sm space-y-1.5 max-h-36 overflow-y-auto">
+          ${templates.map(t => `<li class="flex items-center gap-2">
+            <span class="text-xs px-1.5 py-0.5 rounded ${t.is_builtin ? 'bg-emerald-50 text-emerald-600' : 'bg-amber-50 text-amber-600'}">${t.is_builtin ? '内置' : '自定义'}</span>
+            <span>${t.broker_name}</span><span class="text-xs text-slate-400">v${t.version} · ${t.source_type}</span></li>`).join('')}
+        </ul>
+      </div>
+    </div>
+
+    <div id="mapper-area"></div>
+
+    <div class="bg-white rounded-xl border border-slate-200">
+      <h3 class="font-semibold px-5 pt-4 pb-2">导入批次记录</h3>
+      <div class="overflow-x-auto"><table class="min-w-full text-sm">
+        <thead class="bg-slate-50 text-slate-500 text-xs"><tr>
+          ${['时间', '文件名', '命中模板', '总行数', '成功', '失败', '状态', 'SHA256'].map(h => `<th class="px-4 py-2 text-left font-medium">${h}</th>`).join('')}
+        </tr></thead>
+        <tbody>${batches.length ? batches.map(b => `<tr class="border-t border-slate-100">
+          <td class="px-4 py-2 whitespace-nowrap">${fmtDateTime(b.created_at)}</td>
+          <td class="px-4 py-2">${b.file_name}</td>
+          <td class="px-4 py-2">${b.broker_name || '<span class="text-slate-400">—</span>'}</td>
+          <td class="px-4 py-2 text-right">${b.total_rows ?? '-'}</td>
+          <td class="px-4 py-2 text-right text-emerald-600">${b.parsed_rows ?? '-'}</td>
+          <td class="px-4 py-2 text-right ${b.failed_rows ? 'text-red-600' : ''}">${b.failed_rows ?? '-'}</td>
+          <td class="px-4 py-2"><span class="text-xs px-1.5 py-0.5 rounded ${b.status === 'done' ? 'bg-emerald-50 text-emerald-600' : b.status === 'partial' ? 'bg-amber-50 text-amber-600' : 'bg-red-50 text-red-600'}">${b.status}</span></td>
+          <td class="px-4 py-2 text-xs text-slate-400 font-mono" title="${b.file_hash}">${(b.file_hash || '').slice(0, 12)}…</td>
+        </tr>`).join('') : '<tr><td colspan="8" class="px-4 py-8 text-center text-slate-400">暂无导入记录</td></tr>'}
+        </tbody></table></div>
+    </div>
+  </div>`;
+
+  el.querySelector('#csv-file').onchange = e => e.target.files[0] && handleFile(e.target.files[0], el);
+  el.querySelector('#gen-mock').onclick = () => { generateMock(el); };
+  el.querySelector('#dl-ht').onclick = () => downloadSample('ht');
+  el.querySelector('#dl-df').onclick = () => downloadSample('df');
+}
+
+// ---------- 文件导入主流程 ----------
+async function handleFile(file, el) {
+  const buf = await file.arrayBuffer();
+  const fileHash = await sha256Hex(buf);
+  if (q1('SELECT id FROM import_batches WHERE file_hash=$h', { $h: fileHash })) {
+    alert('该文件已导入过（SHA256 指纹重复），已拦截重复导入。');
+    return;
+  }
+  const text = decodeBuffer(buf);
+  const rows = parseCSV(text);
+  if (rows.length < 2) { alert('未解析到有效数据行'); return; }
+  const headers = rows[0];
+  const dataRows = rows.slice(1);
+
+  // 模板自动命中：表头哈希匹配 broker_templates.sample_hash
+  const hash = simpleHash(headers.join(','));
+  const tpl = q1('SELECT * FROM broker_templates WHERE sample_hash=$h', { $h: hash });
+  if (tpl) {
+    const mapping = JSON.parse(tpl.column_mapping);
+    doImport({ el, file, fileHash, rows: dataRows, headers, mapping, templateId: tpl.id, templateName: tpl.broker_name });
+  } else {
+    renderMapper(el, { file, fileHash, headers, dataRows });
+  }
+}
+
+// 通用 CSV 映射工具（US-03）：前 5 行预览 + 列->标准字段下拉
+function renderMapper(el, ctx) {
+  const { headers, dataRows } = ctx;
+  const area = el.querySelector('#mapper-area');
+  area.innerHTML = `
+  <div class="bg-white rounded-xl border-2 border-indigo-200 p-5 space-y-4">
+    <h3 class="font-semibold">未命中模板 — 通用 CSV 映射工具</h3>
+    <p class="text-xs text-slate-500">为每一列选择对应的标准字段。保存为自定义模板后，同格式文件再次导入零配置。</p>
+    <div class="overflow-x-auto"><table class="min-w-full text-sm">
+      <thead><tr>${headers.map((h, i) => `
+        <th class="px-3 py-2 text-left">
+          <div class="text-xs text-slate-400 mb-1">原始列：${h || '(空)'}</div>
+          <select data-col="${i}" class="map-sel border rounded-lg px-2 py-1 text-sm w-36">${STD_FIELDS.map(([v, label]) => `<option value="${v}">${label}</option>`).join('')}</select>
+        </th>`).join('')}
+      </tr></thead>
+      <tbody>${dataRows.slice(0, 5).map(r => `<tr class="border-t border-slate-100">${headers.map((_, i) => `<td class="px-3 py-1.5 text-xs text-slate-500">${r[i] ?? ''}</td>`).join('')}</tr>`).join('')}</tbody>
+    </table></div>
+    <div class="flex flex-wrap items-center gap-3">
+      <label class="text-sm text-slate-600">模板名（券商/来源）<input id="tpl-name" class="ml-1 border rounded-lg px-2 py-1.5 text-sm" placeholder="如：QMT客户端导出"></label>
+      <label class="text-sm text-slate-600 flex items-center gap-1"><input id="tpl-save" type="checkbox" checked> 保存为自定义模板</label>
+      <button id="do-import" class="px-4 py-2 bg-indigo-600 text-white rounded-lg text-sm hover:bg-indigo-700">确认映射并导入</button>
+      <button id="cancel-import" class="px-4 py-2 bg-slate-100 rounded-lg text-sm hover:bg-slate-200">取消</button>
+    </div>
+  </div>`;
+
+  // 猜测映射：表头关键字启发式
+  const GUESS = [[/日期/, 'traded_date'], [/时间|时刻/, 'traded_time'], [/代码/, 'symbol'], [/名称/, 'symbol_name'], [/方向|操作|买卖/, 'direction'], [/价格|均价|单价|成交价|价/, 'price'], [/数量|股数|份额/, 'quantity'], [/金额/, 'amount'], [/佣金|手续费/, 'commission'], [/印花/, 'stamp_tax'], [/过户/, 'transfer_fee']];
+  area.querySelectorAll('.map-sel').forEach(sel => {
+    const h = headers[+sel.dataset.col] || '';
+    for (const [re, f] of GUESS) if (re.test(h)) { sel.value = f; break; }
+  });
+
+  area.querySelector('#cancel-import').onclick = () => area.innerHTML = '';
+  area.querySelector('#do-import').onclick = () => {
+    const mapping = {};
+    area.querySelectorAll('.map-sel').forEach(sel => { if (sel.value) mapping[headers[+sel.dataset.col]] = sel.value; });
+    const need = ['traded_date', 'symbol', 'direction', 'price', 'quantity', 'amount'];
+    const got = Object.values(mapping);
+    const missing = need.filter(f => !got.includes(f));
+    if (missing.length) { alert(`必填字段未映射：${missing.join('、')}`); return; }
+
+    let templateId = null, templateName = '未保存模板';
+    if (area.querySelector('#tpl-save').checked) {
+      const name = area.querySelector('#tpl-name').value.trim() || '自定义模板';
+      templateId = uuid(); templateName = name;
+      run(`INSERT INTO broker_templates (id, broker_name, source_type, version, column_mapping, parse_rules, is_builtin, sample_hash, created_at)
+           VALUES ($id, $n, 'csv', 1, $m, $p, 0, $h, $ts)`, {
+        $id: templateId, $n: name, $m: JSON.stringify(mapping),
+        $p: JSON.stringify({ direction_map: DIRECTION_MAP }),
+        $h: simpleHash(headers.join(',')), $ts: now(),
+      });
+    }
+    doImport({ el, file: ctx.file, fileHash: ctx.fileHash, rows: ctx.dataRows, headers, mapping, templateId, templateName });
+    area.innerHTML = '';
+  };
+}
+
+// 按映射解析入库 + 批次记录（解析失败行逐行标注原因，US-01 验收）
+function doImport({ el, file, fileHash, rows, headers, mapping, templateId, templateName }) {
+  const batchId = uuid(), ts = now();
+  const colIdx = {};
+  for (const [h, f] of Object.entries(mapping)) {
+    const i = headers.indexOf(h);
+    if (i >= 0) colIdx[f] = i;
+  }
+  let ok = 0; const errors = [];
+  rows.forEach((r, i) => {
+    const rowNo = i + 2; // 原文件行号（含表头行）
+    try {
+      const tradedAt = parseDateTime(r[colIdx.traded_date], colIdx.traded_time !== undefined ? r[colIdx.traded_time] : null);
+      // 代码归一化：券商导出常带交易所前后缀（SH600887 / 600887.SH / sh.600887），
+      // 统一提取 6 位数字后再校验，否则真实文件会被整批判为格式异常
+      const rawSymbol = String(r[colIdx.symbol] || '').trim();
+      const symbol = (rawSymbol.match(/\d{6}/) || [rawSymbol])[0];
+      const direction = DIRECTION_MAP[String(r[colIdx.direction] || '').trim()];
+      const price = parseFloat(r[colIdx.price]), quantity = parseInt(r[colIdx.quantity]), amount = parseFloat(r[colIdx.amount]);
+      if (!tradedAt) throw new Error('成交日期无法解析');
+      if (!/^\d{6}$/.test(symbol)) throw new Error(`证券代码格式异常：${rawSymbol}`);
+      if (!direction) throw new Error(`买卖方向无法识别：${r[colIdx.direction]}`);
+      if (!(price > 0)) throw new Error('成交价格必须为正数');
+      if (!(quantity > 0)) throw new Error('成交数量必须为正数');
+      if (!(amount > 0)) throw new Error('成交金额必须为正数');
+      if (Math.abs(price * quantity - amount) / amount > 0.01) throw new Error('价格×数量 与成交金额偏差 >1%，校验未过');
+      let fee;
+      if (colIdx.commission !== undefined || colIdx.stamp_tax !== undefined || colIdx.transfer_fee !== undefined) {
+        fee = (parseFloat(r[colIdx.commission]) || 0) + (parseFloat(r[colIdx.stamp_tax]) || 0) + (parseFloat(r[colIdx.transfer_fee]) || 0);
+        fee = Math.round(fee * 100) / 100;
+      } else {
+        fee = calcFee(direction, amount); // 缺费用列时按费率确定性补算
+      }
+      run(`INSERT INTO trades (id, user_id, import_batch_id, source_row_no, symbol, symbol_name, direction, price, quantity, amount, fee, traded_at, market, created_at)
+           VALUES ($id, $u, $b, $row, $sym, $name, $dir, $price, $qty, $amt, $fee, $ts2, $mkt, $ts)`, {
+        $id: uuid(), $u: LOCAL_USER_ID, $b: batchId, $row: rowNo, $sym: symbol,
+        $name: colIdx.symbol_name !== undefined ? String(r[colIdx.symbol_name] || '') : '',
+        $dir: direction, $price: price, $qty: quantity, $amt: amount, $fee: fee,
+        $ts2: tradedAt, $mkt: marketOf(symbol), $ts: ts,
+      });
+      ok++;
+    } catch (e) { errors.push({ 行号: rowNo, 原因: e.message }); }
+  });
+
+  run(`INSERT INTO import_batches (id, user_id, template_id, source_type, file_name, file_hash, raw_file_path, total_rows, parsed_rows, failed_rows, parse_errors, status, created_at)
+       VALUES ($id, $u, $tid, 'csv', $fn, $fh, $path, $total, $ok, $fail, $err, $st, $ts)`, {
+    $id: batchId, $u: LOCAL_USER_ID, $tid: templateId, $fn: file.name, $fh: fileHash,
+    $path: `local://${file.name}`, // 原型无本地文件系统，记录逻辑路径
+    $total: rows.length, $ok: ok, $fail: errors.length,
+    $err: JSON.stringify(errors), $st: errors.length ? (ok ? 'partial' : 'failed') : 'done', $ts: ts,
+  });
+
+  repairAll();       // FIFO 配对回写
+  reMatchPlans();    // 计划-成交确定性匹配
+  runRuleEngine();   // 纪律规则跑批
+  alert(`导入完成（模板：${templateName}）\n成功 ${ok} 行，失败 ${errors.length} 行${errors.length ? '\n失败原因可在批次记录 parse_errors 查看' : ''}`);
+  renderImport(el);
+}
+
+// ---------- 模拟数据（确定性 RNG，评审可复现；mulberry32 见 db.js） ----------
+const STOCKS = [
+  ['600519', '贵州茅台', 1480, 1720, 100, 100], ['000001', '平安银行', 11.2, 13.1, 500, 2000],
+  ['300750', '宁德时代', 182, 218, 100, 300], ['601318', '中国平安', 45, 54, 200, 800],
+  ['000858', '五粮液', 122, 148, 100, 400], ['002594', '比亚迪', 232, 276, 100, 300],
+  ['600036', '招商银行', 32, 39.5, 300, 1000], ['601899', '紫金矿业', 17.5, 22, 500, 2000],
+  ['300059', '东方财富', 15, 19.5, 500, 2000], ['688981', '中芯国际', 84, 99, 100, 300],
+];
+
+function generateMock(el) {
+  const rnd = mulberry32(20261027); // 固定种子，评审可复现
+  const pick = arr => arr[Math.floor(rnd() * arr.length)];
+  const rr = (lo, hi, dp = 2) => { const f = Math.pow(10, dp); return Math.round((lo + rnd() * (hi - lo)) * f) / f; };
+  const round100 = n => Math.max(100, Math.round(n / 100) * 100);
+  const ts = (y, m, d, h, mi) => Math.floor(new Date(y, m - 1, d, h, mi).getTime() / 1000);
+  const isWeekday = (y, m, d) => { const w = new Date(y, m - 1, d).getDay(); return w >= 1 && w <= 5; };
+  const nextWeekday = (y, m, d) => { while (!isWeekday(y, m, d)) { const t2 = new Date(y, m - 1, d + 1); y = t2.getFullYear(); m = t2.getMonth() + 1; d = t2.getDate(); } return [y, m, d]; };
+
+  const batchId = uuid(), nowTs = now();
+  const rows = []; // {symbol,name,dir,price,qty,t,tag}
+  let rowNo = 1;
+  const addTrade = (s, dir, price, qty, t, tag) => {
+    rows.push({ symbol: s[0], name: s[1], dir, price, qty, t, tag: tag || null, rowNo: rowNo++ });
+  };
+  const tradeTime = () => pick([[9, 35], [9, 48], [10, 12], [10, 40], [11, 5], [13, 15], [13, 50], [14, 20]]);
+
+  // --- 常规往返 22 趟（2026-07-27 ~ 2026-10-24） ---
+  for (let i = 0; i < 22; i++) {
+    const s = pick(STOCKS);
+    const dayOff = Math.floor(rnd() * 62); // 07-27 起 62 天内
+    let d = new Date(2026, 6, 27 + dayOff);
+    let [by, bm, bd] = nextWeekday(d.getFullYear(), d.getMonth() + 1, d.getDate());
+    const hold = pick([1, 2, 3, 3, 5, 5, 8, 13, 15]);
+    let close = new Date(by, bm - 1, bd + hold);
+    const buyPrice = rr(s[2], s[3]);
+    const qty = round100(s[4] + rnd() * (s[5] - s[4]));
+    const [bh, bmi] = tradeTime();
+    const buyT = ts(by, bm, bd, bh, bmi);
+    const openEnded = close > new Date(2026, 9, 24) || rnd() < 0.09; // 少量未平仓
+    if (openEnded) { addTrade(s, 'buy', buyPrice, qty, buyT); continue; }
+    let [sy, sm, sd] = nextWeekday(close.getFullYear(), close.getMonth() + 1, close.getDate());
+    const sellPrice = Math.round(buyPrice * (1 + rr(-0.08, 0.115, 3)) * 100) / 100;
+    const [sh, smi] = tradeTime();
+    addTrade(s, 'buy', buyPrice, qty, buyT, rnd() < 0.25 ? '计划内' : null);
+    addTrade(s, 'sell', sellPrice, qty, ts(sy, sm, sd, sh, smi));
+  }
+
+  // --- 冲动交易周：2026-09-07 当周密集 6 趟（12+ 笔，触发单周 ≤10 规则） ---
+  const clusterDays = [[9, 7, 9, 8], [9, 7, 9, 9], [9, 8, 9, 9], [9, 8, 9, 10], [9, 9, 9, 10], [9, 9, 9, 11]];
+  clusterDays.forEach((cd, i) => {
+    const s = pick(STOCKS);
+    const buyPrice = rr(s[2], s[3]);
+    const qty = round100(s[4] + rnd() * (s[5] - s[4]));
+    addTrade(s, 'buy', buyPrice, qty, ts(2026, cd[0], cd[1], i % 2 ? 14 : 10, i % 2 ? 52 : 20), '追涨'); // 部分尾盘追高
+    addTrade(s, 'sell', Math.round(buyPrice * (1 + rr(-0.05, 0.07, 3)) * 100) / 100, qty, ts(2026, cd[2], cd[3], 10, 5));
+  });
+
+  // --- 违规1：尾盘追高买入（14:50 后） ---
+  [[9, 15, 14, 53], [10, 13, 14, 55]].forEach(v => {
+    const s = pick(STOCKS);
+    const buyPrice = rr(s[2], s[3]);
+    const qty = round100(s[4] + rnd() * (s[5] - s[4]));
+    addTrade(s, 'buy', buyPrice, qty, ts(2026, v[0], v[1], v[2], v[3]), '追涨');
+    addTrade(s, 'sell', Math.round(buyPrice * (1 + rr(-0.04, 0.06, 3)) * 100) / 100, qty, ts(2026, v[0], v[1] + 4, 10, 30));
+  });
+
+  // --- 违规2：单票超仓位（茅台 200 股 ≈ 32 万 > 100 万本金 × 30%） ---
+  addTrade(STOCKS[0], 'buy', 1605.50, 200, ts(2026, 8, 20, 9, 40));
+  addTrade(STOCKS[0], 'sell', 1678.00, 200, ts(2026, 9, 11, 10, 15));
+
+  // --- 违规3：止损纪律（宁德时代 -10% 才割，超 -7% 红线） ---
+  addTrade(STOCKS[2], 'buy', 210.00, 100, ts(2026, 8, 26, 10, 0));
+  addTrade(STOCKS[2], 'sell', 189.00, 100, ts(2026, 9, 2, 13, 40), '止损');
+
+  // --- 今日买入（演示 T+1 锁定） + 2 笔未平仓 ---
+  addTrade(STOCKS[6], 'buy', 36.80, 500, ts(2026, 10, 27, 9, 45));
+  addTrade(STOCKS[8], 'buy', 17.60, 1000, ts(2026, 10, 23, 13, 20));
+  addTrade(STOCKS[9], 'buy', 92.30, 100, ts(2026, 10, 26, 10, 50));
+
+  // 落库（费用确定性计算：佣金万2.5最低5元/印花税卖出0.05%/过户费0.001%）
+  rows.sort((a, b) => a.t - b.t);
+  rows.forEach((r, i) => {
+    const amount = Math.round(r.price * r.qty * 100) / 100;
+    run(`INSERT INTO trades (id, user_id, import_batch_id, source_row_no, symbol, symbol_name, direction, price, quantity, amount, fee, traded_at, market, tags, created_at)
+         VALUES ($id, $u, $b, $row, $sym, $name, $dir, $price, $qty, $amt, $fee, $t, $mkt, $tags, $ts)`, {
+      $id: uuid(), $u: LOCAL_USER_ID, $b: batchId, $row: i + 2, $sym: r.symbol, $name: r.name,
+      $dir: r.dir, $price: r.price, $qty: r.qty, $amt: amount, $fee: calcFee(r.dir, amount),
+      $t: r.t, $mkt: marketOf(r.symbol), $tags: JSON.stringify(r.tag ? [r.tag] : []), $ts: nowTs,
+    });
+  });
+  run(`INSERT INTO import_batches (id, user_id, template_id, source_type, file_name, file_hash, raw_file_path, total_rows, parsed_rows, failed_rows, parse_errors, status, created_at)
+       VALUES ($id, $u, NULL, 'csv', '模拟数据（内置生成）', $fh, 'generated://mock', $n, $n, 0, '[]', 'done', $ts)`, {
+    $id: batchId, $u: LOCAL_USER_ID, $fh: 'mock-' + nowTs, $n: rows.length, $ts: nowTs,
+  });
+
+  repairAll();
+  reMatchPlans();
+  runRuleEngine();
+  alert(`已生成 ${rows.length} 笔模拟成交（2026-07-27 ~ 2026-10-27），含故意埋入的违规样本，去「归因看板」和「纪律系统」查看效果。`);
+  renderImport(el);
+}
+
+// ---------- 样例 CSV 下载（供评审走真实导入流程） ----------
+function downloadSample(which) {
+  let name, content;
+  if (which === 'ht') {
+    name = '华泰证券_交割单样例.csv';
+    content = '成交日期,成交时间,证券代码,证券名称,买卖方向,成交价格,成交数量,成交金额,佣金,印花税,过户费\n'
+      + '2026-08-03,09:31:25,000001,平安银行,买入,12.35,1000,12350.00,5.00,0.00,0.12\n'
+      + '2026-08-07,10:05:41,000001,平安银行,卖出,12.88,1000,12880.00,5.00,6.44,0.13\n'
+      + '2026-08-11,13:22:10,600036,招商银行,买入,35.20,500,17600.00,5.00,0.00,0.18\n'
+      + '2026-08-21,14:02:33,600036,招商银行,卖出,36.10,500,18050.00,5.00,9.03,0.18\n'
+      + '2026-09-01,09:55:08,601899,紫金矿业,买入,19.40,1000,19400.00,5.00,0.00,0.19\n';
+  } else {
+    name = '东方财富证券_交割单样例.csv';
+    content = '日期,时间,证券代码,证券名称,操作,成交均价,成交数量,成交金额,手续费,印花税,过户费\n'
+      + '2026-09-08,10:11:47,300059,东方财富,买入,16.85,1500,25275.00,6.32,0.00,0.25\n'
+      + '2026-09-18,14:28:03,300059,东方财富,卖出,17.42,1500,26130.00,6.53,13.07,0.26\n'
+      + '2026-10-12,09:42:19,601318,中国平安,买入,49.60,400,19840.00,5.00,0.00,0.20\n'
+      + '2026-10-20,11:06:55,601318,中国平安,卖出,51.30,400,20520.00,5.13,10.26,0.21\n';
+  }
+  const blob = new Blob(['﻿' + content], { type: 'text/csv;charset=utf-8' });
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob); a.download = name; a.click();
+  URL.revokeObjectURL(a.href);
+}
+
+
+// ============================================================
+// ===== 拼接文件 6/10：js/analytics.js =====
+// ============================================================
+// ============================================================
+// analytics.js — 基础归因看板（P0-M3，默认首页）
+// 全部为确定性计算（JS 等价 SQL 逻辑逐指标注释），每个数字可点击溯源
+// ============================================================
+
+let heatMonth = null; // 日历热力图当前月份
+
+function renderDashboard(el) {
+  const trades = q('SELECT * FROM trades WHERE user_id=$u ORDER BY traded_at', { $u: LOCAL_USER_ID });
+  if (!trades.length) {
+    el.innerHTML = `
+    <div class="p-6">
+      <div class="bg-white rounded-2xl border border-dashed border-slate-300 p-16 text-center">
+        <div class="text-lg font-semibold text-slate-700 mb-2">还没有数据，先导入交割单</div>
+        <p class="text-sm text-slate-500 mb-5">导入交割单是激活路径的必经环节——归因与纪律都建立在真实成交之上。<br>也可以先生成 3 个月模拟数据，零成本体验完整闭环。</p>
+        <a href="#/import" class="inline-block px-5 py-2.5 bg-indigo-600 text-white rounded-lg hover:bg-indigo-700 text-sm">前往交割单导入中心</a>
+      </div>
+    </div>`;
+    return;
+  }
+
+  const pairs = repairAll();
+  const closed = pairs.closed;
+
+  // ---------- 指标区（每个指标附 SQL 口径注释） ----------
+  // 累计盈亏：SELECT SUM(每笔完整交易净盈亏) —— 净盈亏=卖出净额−买入成本(含费)，来自 FIFO 配对
+  const totalPnl = Math.round(closed.reduce((s, c) => s + c.pnl, 0) * 100) / 100;
+  // 本月盈亏：SELECT SUM(pnl) WHERE strftime('%Y-%m', closeAt)=本月
+  const thisMonth = monthKey(Date.now() / 1000);
+  const monthPnl = Math.round(closed.filter(c => monthKey(c.closeAt) === thisMonth).reduce((s, c) => s + c.pnl, 0) * 100) / 100;
+  // 胜率：盈利笔数 / 已平仓总笔数（SELECT COUNT(*) WHERE pnl>0 / COUNT(*)）
+  const wins = closed.filter(c => c.pnl > 0);
+  const winRate = closed.length ? wins.length / closed.length : null;
+  // 盈亏比：平均盈利 / 平均亏损绝对值
+  const losses = closed.filter(c => c.pnl < 0);
+  const avgWin = wins.length ? wins.reduce((s, c) => s + c.pnl, 0) / wins.length : 0;
+  const avgLoss = losses.length ? Math.abs(losses.reduce((s, c) => s + c.pnl, 0) / losses.length) : 0;
+  const profitFactor = avgLoss > 0 ? avgWin / avgLoss : null;
+  // 平均持仓周期：AVG(closeAt - openAt)，单位天
+  const avgHold = closed.length ? closed.reduce((s, c) => s + c.holdingDays, 0) / closed.length : null;
+  // 纪律执行率：1 − 违规笔数/总交易笔数（来自纪律系统）
+  const ds = disciplineScore();
+
+  // 持仓周期分布：<1天 / 1-3天 / 3-10天 / >10天
+  const buckets = [
+    { label: '<1天(T+0)', test: d => d < 1, count: 0, pnl: 0 },
+    { label: '1-3天', test: d => d >= 1 && d <= 3, count: 0, pnl: 0 },
+    { label: '3-10天', test: d => d > 3 && d <= 10, count: 0, pnl: 0 },
+    { label: '>10天', test: d => d > 10, count: 0, pnl: 0 },
+  ];
+  for (const c of closed) {
+    const b = buckets.find(b => b.test(c.holdingDays));
+    b.count++; b.pnl = Math.round((b.pnl + c.pnl) * 100) / 100;
+  }
+  const maxBucket = Math.max(...buckets.map(b => b.count), 1);
+
+  // 个股盈亏排名（已实现）：SELECT symbol, SUM(pnl) GROUP BY symbol ORDER BY ...
+  const bySymbol = {};
+  for (const c of closed) {
+    (bySymbol[c.symbol] = bySymbol[c.symbol] || { symbol: c.symbol, name: c.symbolName, pnl: 0, count: 0, trades: [] });
+    bySymbol[c.symbol].pnl += c.pnl; bySymbol[c.symbol].count++; bySymbol[c.symbol].trades.push(c);
+  }
+  const symList = Object.values(bySymbol).map(s => ({ ...s, pnl: Math.round(s.pnl * 100) / 100 }));
+  const topWin = symList.filter(s => s.pnl > 0).sort((a, b) => b.pnl - a.pnl).slice(0, 5);
+  const topLose = symList.filter(s => s.pnl < 0).sort((a, b) => a.pnl - b.pnl).slice(0, 5);
+
+  // 月度盈亏日历：已实现盈亏按平仓日落位（A股习惯：红涨绿跌）
+  if (!heatMonth) heatMonth = monthKey(closed[0] ? closed[0].closeAt : Date.now() / 1000);
+  const byDay = {};
+  for (const c of closed) {
+    const k = dayKey(c.closeAt);
+    (byDay[k] = byDay[k] || { pnl: 0, trades: [] }).pnl += c.pnl;
+    byDay[k].trades.push(c);
+  }
+
+  // 标签维度归因（行为归因雏形）：SELECT tag, SUM(pnl) FROM 完整交易×标签
+  const byTag = {};
+  for (const c of closed) {
+    for (const tag of c.tags) {
+      (byTag[tag] = byTag[tag] || { tag, pnl: 0, count: 0, trades: [] });
+      byTag[tag].pnl += c.pnl; byTag[tag].count++; byTag[tag].trades.push(c);
+    }
+  }
+  const tagList = Object.values(byTag).map(t => ({ ...t, pnl: Math.round(t.pnl * 100) / 100 })).sort((a, b) => a.pnl - b.pnl);
+
+  el.innerHTML = `
+  <div class="p-6 space-y-6">
+    <!-- KPI 卡片：每个数字可点击溯源 -->
+    <div class="grid grid-cols-2 md:grid-cols-3 xl:grid-cols-6 gap-3">
+      ${[
+        ['累计盈亏', pnlTxt(totalPnl), pnlCls(totalPnl), 'closed', `已平仓 ${closed.length} 笔`],
+        ['本月已实现盈亏', pnlTxt(monthPnl), pnlCls(monthPnl), 'month', thisMonth],
+        ['胜率', winRate === null ? '—' : fmtPct(winRate), 'text-slate-800', 'winrate', `${wins.length}胜 / ${closed.length}笔`],
+        ['盈亏比', profitFactor === null ? '—' : profitFactor.toFixed(2), 'text-slate-800', 'pf', `均盈${fmtMoney(avgWin)} / 均亏${fmtMoney(avgLoss)}`],
+        ['平均持仓周期', avgHold === null ? '—' : avgHold.toFixed(1) + ' 天', 'text-slate-800', 'hold', 'FIFO 配对口径'],
+        ['纪律执行率', ds.score === null ? '—' : fmtPct(ds.score), ds.score !== null && ds.score < 0.9 ? 'text-amber-500' : 'text-emerald-600', 'discipline', `${ds.violated} 笔违规 / ${ds.total} 笔 · 全历史`],
+      ].map(([label, value, cls, key, sub]) => `
+        <button class="kpi-card bg-white rounded-xl border border-slate-200 p-4 text-left hover:border-indigo-300 hover:shadow-sm transition" data-trace="${key}">
+          <div class="text-xs text-slate-500">${label}</div>
+          <div class="text-xl font-bold mt-1 ${cls}">${value}</div>
+          <div class="text-xs text-slate-400 mt-1">${sub}</div>
+        </button>`).join('')}
+    </div>
+
+    <div class="grid grid-cols-1 lg:grid-cols-2 gap-4">
+      <!-- 持仓周期分布（SVG 手绘柱状图） -->
+      <div class="bg-white rounded-xl border border-slate-200 p-5">
+        <h3 class="font-semibold text-sm mb-4">持仓周期分布 <span class="text-xs font-normal text-slate-400">笔数 / 合计盈亏</span></h3>
+        <div class="space-y-3">${buckets.map(b => `
+          <button class="bucket-row w-full flex items-center gap-3 group" data-bucket="${b.label}">
+            <span class="w-20 text-xs text-slate-500 text-right">${b.label}</span>
+            <div class="flex-1 h-6 bg-slate-100 rounded overflow-hidden">
+              <div class="h-full rounded ${b.pnl >= 0 ? 'bg-red-300' : 'bg-green-300'} group-hover:opacity-80" style="width:${b.count / maxBucket * 100}%"></div>
+            </div>
+            <span class="w-28 text-xs text-left ${pnlCls(b.pnl)}">${b.count}笔 · ${pnlTxt(b.pnl)}</span>
+          </button>`).join('')}
+        </div>
+      </div>
+
+      <!-- 个股盈亏排名 -->
+      <div class="bg-white rounded-xl border border-slate-200 p-5">
+        <h3 class="font-semibold text-sm mb-3">个股盈亏排名（已实现，Top5）</h3>
+        <div class="grid grid-cols-2 gap-4">
+          <div><div class="text-xs text-red-500 mb-2 font-medium">盈利 Top5</div>
+            ${topWin.length ? topWin.map(s => `<button class="sym-row block w-full text-left text-sm py-1 hover:bg-slate-50 rounded px-1" data-sym="${esc(s.symbol)}">
+              <span class="font-mono text-xs text-slate-400">${esc(s.symbol)}</span> ${esc(s.name)}
+              <span class="float-right text-red-600 font-medium">+${fmtMoney(s.pnl)}</span></button>`).join('') : '<div class="text-xs text-slate-300">无</div>'}
+          </div>
+          <div><div class="text-xs text-green-600 mb-2 font-medium">亏损 Top5</div>
+            ${topLose.length ? topLose.map(s => `<button class="sym-row block w-full text-left text-sm py-1 hover:bg-slate-50 rounded px-1" data-sym="${esc(s.symbol)}">
+              <span class="font-mono text-xs text-slate-400">${esc(s.symbol)}</span> ${esc(s.name)}
+              <span class="float-right text-green-600">${fmtMoney(s.pnl)}</span></button>`).join('') : '<div class="text-xs text-slate-300">无</div>'}
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <div class="grid grid-cols-1 lg:grid-cols-2 gap-4">
+      <!-- 月度盈亏日历热力图 -->
+      <div class="bg-white rounded-xl border border-slate-200 p-5">
+        <div class="flex items-center mb-3">
+          <h3 class="font-semibold text-sm">月度盈亏日历 <span class="text-xs font-normal text-slate-400">按平仓日落位 · 红盈绿亏 · 点击溯源</span></h3>
+          <input id="heat-month" type="month" value="${heatMonth}" class="ml-auto border rounded-lg px-2 py-1 text-sm">
+        </div>
+        <div id="heatmap"></div>
+      </div>
+
+      <!-- 标签维度归因 -->
+      <div class="bg-white rounded-xl border border-slate-200 p-5">
+        <h3 class="font-semibold text-sm mb-1">标签维度归因 <span class="text-xs font-normal text-slate-400">行为归因雏形：亏在哪类动作上</span></h3>
+        <p class="text-xs text-slate-400 mb-3">在「复盘账本」给成交打标签（追涨/止损/计划内…），这里自动汇总每类行为的合计盈亏。</p>
+        ${tagList.length ? `<div class="space-y-2">${tagList.map(t => `
+          <button class="tag-row w-full flex items-center gap-3 hover:bg-slate-50 rounded px-1 py-1" data-tag="${esc(t.tag)}">
+            <span class="inline-block bg-indigo-50 text-indigo-600 rounded px-2 py-0.5 text-xs w-16 text-center">${esc(t.tag)}</span>
+            <div class="flex-1 h-2 bg-slate-100 rounded overflow-hidden">
+              <div class="h-full ${t.pnl >= 0 ? 'bg-red-400' : 'bg-green-400'} rounded" style="width:${Math.min(100, Math.abs(t.pnl) / Math.max(...tagList.map(x => Math.abs(x.pnl)), 1) * 100)}%"></div>
+            </div>
+            <span class="w-40 text-xs text-right ${pnlCls(t.pnl)}">${t.count}笔 · ${pnlTxt(t.pnl)}</span>
+          </button>`).join('')}</div>`
+        : '<div class="text-slate-300 text-sm py-8 text-center">暂无标签数据</div>'}
+      </div>
+    </div>
+  </div>`;
+
+  renderHeatmap();
+
+  el.querySelector('#heat-month').onchange = e => { heatMonth = e.target.value || heatMonth; renderHeatmap(); };
+
+  function renderHeatmap() {
+    const [y, m] = heatMonth.split('-').map(Number);
+    const daysInMonth = new Date(y, m, 0).getDate();
+    const firstWeekday = (new Date(y, m - 1, 1).getDay() + 6) % 7; // 周一=0
+    const cells = [];
+    for (let i = 0; i < firstWeekday; i++) cells.push('<div></div>');
+    for (let d = 1; d <= daysInMonth; d++) {
+      const key = `${heatMonth}-${String(d).padStart(2, '0')}`;
+      const rec = byDay[key];
+      let cls = 'bg-slate-50 text-slate-400';
+      if (rec) {
+        const a = Math.min(1, Math.abs(rec.pnl) / 3000); // 3000 元为满色锚点
+        cls = rec.pnl >= 0
+          ? `text-white ${a > 0.66 ? 'bg-red-500' : a > 0.33 ? 'bg-red-400' : 'bg-red-300'}`
+          : `text-white ${a > 0.66 ? 'bg-green-500' : a > 0.33 ? 'bg-green-400' : 'bg-green-300'}`;
+      }
+      cells.push(`<button class="heat-cell aspect-square rounded-md text-xs flex flex-col items-center justify-center ${cls} ${rec ? 'hover:ring-2 ring-indigo-300 cursor-pointer' : 'cursor-default'}" data-day="${rec ? key : ''}">
+        <span>${d}</span>${rec ? `<span class="text-[10px] font-medium">${rec.pnl >= 0 ? '+' : ''}${Math.round(rec.pnl)}</span>` : ''}
+      </button>`);
+    }
+    el.querySelector('#heatmap').innerHTML = `
+      <div class="grid grid-cols-7 gap-1 text-center text-xs text-slate-400 mb-1">${['一', '二', '三', '四', '五', '六', '日'].map(w => `<div>${w}</div>`).join('')}</div>
+      <div class="grid grid-cols-7 gap-1">${cells.join('')}</div>`;
+    el.querySelectorAll('.heat-cell').forEach(c => c.onclick = () => {
+      if (!c.dataset.day) return;
+      const rec = byDay[c.dataset.day];
+      showClosedTrace(`${c.dataset.day} 平仓交易（合计 ${pnlTxt(rec.pnl)}）`, rec.trades);
+    });
+  }
+
+  // ---------- 点击溯源（§7.3：每个数字可展开到原始成交记录） ----------
+  el.querySelectorAll('.kpi-card').forEach(card => card.onclick = () => {
+    const key = card.dataset.trace;
+    if (key === 'closed') showClosedTrace('全部已平仓交易', closed);
+    else if (key === 'month') showClosedTrace(`${thisMonth} 已平仓交易`, closed.filter(c => monthKey(c.closeAt) === thisMonth));
+    else if (key === 'winrate') showClosedTrace('盈利交易（胜率分子）', wins);
+    else if (key === 'pf') showClosedTrace('盈利 vs 亏损交易', closed);
+    else if (key === 'hold') showClosedTrace('全部已平仓交易（含持仓天数）', closed);
+    else if (key === 'discipline') location.hash = '#/discipline';
+  });
+  el.querySelectorAll('.bucket-row').forEach(b => b.onclick = () => {
+    const bk = buckets.find(x => x.label === b.dataset.bucket);
+    showClosedTrace(`持仓周期 ${bk.label} 的交易`, closed.filter(c => bk.test(c.holdingDays)));
+  });
+  el.querySelectorAll('.sym-row').forEach(b => b.onclick = () => {
+    const s = symList.find(x => x.symbol === b.dataset.sym);
+    showClosedTrace(`${s.symbol} ${s.name} 已平仓交易（合计 ${pnlTxt(s.pnl)}）`, s.trades);
+  });
+  el.querySelectorAll('.tag-row').forEach(b => b.onclick = () => {
+    const t = tagList.find(x => x.tag === b.dataset.tag);
+    showClosedTrace(`标签「${t.tag}」相关交易（合计 ${pnlTxt(t.pnl)}）`, t.trades);
+  });
+}
+
+// 溯源弹窗：完整交易 -> 展开到底层 trades 记录（含导入批次与行号）
+function showClosedTrace(title, list) {
+  // id 为本系统生成的 UUID，安全拼入 IN 列表（无用户输入注入风险）
+  const tradeIds = [...new Set(list.flatMap(c => [...c.buyTradeIds, ...c.sellTradeIds]))];
+  const safeRows = tradeIds.length
+    ? q(`SELECT t.*, b.file_name FROM trades t JOIN import_batches b ON b.id=t.import_batch_id
+         WHERE t.id IN (${tradeIds.map(id => `'${id}'`).join(',')}) ORDER BY t.traded_at`)
+    : [];
+
+  openModal({
+    title: esc(title),
+    titleExtra: '溯源链：看板数字 → 完整交易 → 原始成交（导入批次+行号）',
+    bodyHTML: `
+      <table class="min-w-full text-sm">
+        <thead class="bg-slate-50 text-slate-500 text-xs"><tr>
+          ${['时间', '代码', '名称', '方向', '价格', '数量', '金额', '费用', '配对', '来源'].map(h => `<th class="px-3 py-2 text-left font-medium">${h}</th>`).join('')}
+        </tr></thead>
+        <tbody>${safeRows.map(t => `<tr class="border-t border-slate-100">
+          <td class="px-3 py-2 whitespace-nowrap">${fmtDate(t.traded_at)} ${String(new Date(t.traded_at * 1000).getHours()).padStart(2, '0')}:${String(new Date(t.traded_at * 1000).getMinutes()).padStart(2, '0')}</td>
+          <td class="px-3 py-2 font-mono">${esc(t.symbol)}</td>
+          <td class="px-3 py-2">${esc(t.symbol_name || '')}</td>
+          <td class="px-3 py-2">${t.direction === 'buy' ? '<span class="text-red-600">买入</span>' : '<span class="text-green-600">卖出</span>'}</td>
+          <td class="px-3 py-2 text-right">${fmtMoney(t.price)}</td>
+          <td class="px-3 py-2 text-right">${t.quantity}</td>
+          <td class="px-3 py-2 text-right">${fmtMoney(t.amount)}</td>
+          <td class="px-3 py-2 text-right">${fmtMoney(t.fee)}</td>
+          <td class="px-3 py-2 text-xs text-slate-400">${t.pair_id || '未平仓'}</td>
+          <td class="px-3 py-2 text-xs text-slate-400">${esc(t.file_name)} #${t.source_row_no}</td>
+        </tr>`).join('')}</tbody>
+      </table>`,
+  });
+}
+
+
+// ============================================================
+// ===== 拼接文件 7/10：js/signal.js =====
+// ============================================================
+// ============================================================
+// signal.js — P1-M6 信号 vs 成交三层对照
+// 全部确定性计算：匹配规则 v1 / 滑点 / 延迟 / 执行率 / 漏跟单率
+// 红线：不引入 LLM；signal_fills 全部字段为确定性写入
+// ============================================================
+
+// ---------- 表头归一化：去 BOM / 空白 / 单位括号 ----------
+function normHeader(h) {
+  return String(h || '')
+    .replace(/^\uFEFF/, '')
+    .replace(/[\s\u3000]/g, '')
+    .replace(/（/g, '(').replace(/）/g, ')')
+    .replace(/\([^)]*\)/g, '')          // 委托价格(元) → 委托价格
+    .replace(/[，,.:：]/g, '')
+    .toLowerCase();
+}
+
+// ---------- 股票代码归一化：600519.SH / SH600519 / sh.600519 → 600519 ----------
+// 必须归一化，否则与 trades.symbol（6 位纯数字）永远匹配不上，全部误判为漏跟单
+function normSymbol(s) {
+  const raw = String(s || '').trim();
+  const m = raw.match(/(\d{6})/);
+  return m ? m[1] : (raw || null);
+}
+
+// ---------- 数值清洗：千分位 / 单位后缀 ----------
+function parsePrice(v) {
+  const s = String(v === null || v === undefined ? '' : v).replace(/[,\s元]/g, '');
+  const n = parseFloat(s);
+  return n > 0 ? Math.round(n * 1000) / 1000 : null;
+}
+function parseQty(v) {
+  const s = String(v === null || v === undefined ? '' : v).replace(/[,\s]/g, '');
+  const isHand = s.indexOf('手') >= 0;   // A 股 1 手 = 100 股
+  const n = Math.floor(parseFloat(s.replace(/[手股张]/g, '')));
+  if (!(n > 0)) return null;
+  return isHand ? n * 100 : n;
+}
+
+// ---------- 表头语义识别（不绑定列数 / 列序） ----------
+// 真实导出文件普遍带「委托编号 / 证券名称 / 成交金额 / 手续费」等噪音列，
+// 且各家列数不同，因此放弃「表头与模板逐列相等」的硬匹配，改按语义角色识别。
+const FIELD_LABEL = {
+  signal_time: '时间', trade_date: '日期', symbol: '代码',
+  direction: '方向', target_price: '价格', target_qty: '数量',
+};
+const IGNORE_RE = /金额|额|名称|name|编号|order_?id|委托号|合同|手续费|佣金|印花税|过户费|fee|commission|备注|remark|状态|status|账户|账号|策略|strategy|持仓|可用|市值|盈亏/;
+
+const BASE_ROLES = [
+  ['signal_time', /时间|^(datetime|time)$|_time$/],
+  ['trade_date', /日期|date/],
+  ['symbol', /代码|symbol|security|标的|^code$|stock_?code|sec_?code/],
+  ['direction', /方向|买卖|操作|^side$|^dir(ection)?$|order_?type|entrust_?side|bs_?flag/],
+];
+// 价格 / 数量分强弱两轮：先认「委托 / 信号 / 目标」语义，缺列时降级取通用价 / 量
+const PRICE_ROLES = [/(委托|信号|目标|计划|预计)价/, /价|price|prc/];
+const QTY_ROLES = [/(委托|信号|目标|计划|预计)(数)?量/, /量|qty|volume|vol/];
+
+function detectColumns(headers) {
+  const norm = headers.map(normHeader);
+  const used = new Set();
+  const map = {};
+  const pick = re => norm.findIndex((h, idx) => !used.has(idx) && !!h && !IGNORE_RE.test(h) && re.test(h));
+  for (const [field, re] of BASE_ROLES) {
+    const i = pick(re);
+    if (i >= 0) { map[field] = i; used.add(i); }
+  }
+  for (const re of PRICE_ROLES) {
+    const i = pick(re);
+    if (i >= 0) { map.target_price = i; used.add(i); break; }
+  }
+  for (const re of QTY_ROLES) {
+    const i = pick(re);
+    if (i >= 0) { map.target_qty = i; used.add(i); break; }
+  }
+  return { map, norm };
+}
+
+function mappingText(headers, map) {
+  return Object.entries(FIELD_LABEL)
+    .filter(([f]) => map[f] !== undefined)
+    .map(([f, label]) => `${label}←「${headers[map[f]]}」`)
+    .join('  ');
+}
+function unmappedHeaders(headers, map) {
+  const usedIdx = new Set(Object.values(map));
+  return headers.filter((h, i) => !usedIdx.has(i) && String(h).trim()).slice(0, 6);
+}
+
+// ---------- 信号 CSV 解析入口 ----------
+// 返回 { ok, errors, mapping, unmapped, dupCount }；mapping 供 UI 展示识别结果（可审计）
+function parseSignalsCSV(text, platformHint = 'other') {
+  const rows = parseCSV(text);
+  if (rows.length < 2) return { ok: [], errors: [{ 行号: 1, 原因: '无有效数据行' }], mapping: '', unmapped: [] };
+
+  const headers = rows[0];
+  const dataRows = rows.slice(1);
+  const { map } = detectColumns(headers);
+
+  // 时间可由「时间列自带日期」或「日期列 + 时间列」拼出，至少要有一列
+  const need = [];
+  if (map.signal_time === undefined && map.trade_date === undefined) need.push('signal_time');
+  ['symbol', 'direction', 'target_price', 'target_qty'].forEach(f => { if (map[f] === undefined) need.push(f); });
+
+  const base = { mapping: mappingText(headers, map), unmapped: unmappedHeaders(headers, map) };
+  if (need.length) {
+    const missTxt = need.map(f => FIELD_LABEL[f]).join('、');
+    return {
+      ...base,
+      ok: [],
+      errors: [{ 行号: 1, 原因: `无法识别必要字段：${missTxt}；实际表头：${headers.join(' / ')}` }],
+    };
+  }
+
+  const ok = [], errors = [];
+  const nowTs = now();
+  const seen = new Set();
+  let dupCount = 0;
+
+  dataRows.forEach((r, i) => {
+    const lineNo = i + 2;
+    try {
+      const tCell = map.signal_time !== undefined ? String(r[map.signal_time] || '').trim() : '';
+      const dCell = map.trade_date !== undefined ? String(r[map.trade_date] || '').trim() : '';
+
+      // 时间列可能自带日期（2026-10-03 09:35:21），否则用日期列拼
+      const d = parseDatePart(tCell) || parseDatePart(dCell);
+      if (!d) throw new Error('日期缺失或无法解析');
+      const t = parseTimePart(tCell) || parseTimePart(dCell) || [9, 30, 0];
+      const ts = toTs(d, t);
+
+      const symbol = normSymbol(r[map.symbol]);
+      if (!symbol) throw new Error('标的代码为空');
+      const dir = normDirection(r[map.direction]);
+      if (!dir) throw new Error(`方向无法识别：${r[map.direction]}`);
+      const price = parsePrice(r[map.target_price]);
+      if (price === null) throw new Error(`价格异常：${r[map.target_price]}`);
+      const qty = parseQty(r[map.target_qty]);
+      if (qty === null) throw new Error(`数量异常：${r[map.target_qty]}`);
+
+      // 完全重复行剔除（同一秒 / 标的 / 方向 / 价格 / 数量）
+      const key = [symbol, dir, price, qty, ts].join('|');
+      if (seen.has(key)) { dupCount++; return; }
+      seen.add(key);
+
+      ok.push({
+        id: uuid(),
+        user_id: LOCAL_USER_ID,
+        platform: platformHint,
+        symbol, direction: dir, signal_price: price, signal_qty: qty,
+        signaled_at: ts, strategy_name: null, backtest_ref: null,
+        import_batch_id: null,
+        created_at: nowTs,
+      });
+    } catch (e) { errors.push({ 行号: lineNo, 原因: e.message }); }
+  });
+
+  return { ...base, ok, errors, dupCount };
+}
+
+// ---------- autoMatch 核心算法 v1 ----------
+// 规则：同一 symbol + 同方向 + 成交时间在信号 [0, +3600] 秒窗口内
+// 一条信号可能对应多笔成交（分批）→ filled / partial
+function autoMatch() {
+  const ts = now();
+  // 清空旧 fill（重新跑）
+  run('DELETE FROM signal_fills');
+
+  const signals = q('SELECT * FROM signals WHERE user_id=$u ORDER BY signaled_at', { $u: LOCAL_USER_ID });
+  const allTrades = q('SELECT * FROM trades WHERE user_id=$u ORDER BY traded_at', { $u: LOCAL_USER_ID });
+
+  if (!signals.length || !allTrades.length) return { signals, fills: [] };
+
+  const fills = [];
+  // 信号 vs 成交匹配
+  for (const sig of signals) {
+    // 窗口内候选成交
+    const candidates = allTrades.filter(t =>
+      t.symbol === sig.symbol && t.direction === sig.direction &&
+      t.traded_at >= sig.signaled_at && t.traded_at <= sig.signaled_at + 3600
+    );
+    if (!candidates.length) {
+      // missed（漏跟单）
+      fills.push({
+        id: uuid(), user_id: LOCAL_USER_ID, signal_id: sig.id, trade_id: null,
+        match_status: 'missed', slippage: null, delay_seconds: null,
+        deviation_amount: null, match_rule_version: 'v1', created_at: ts,
+      });
+      continue;
+    }
+    // 取最早时间 <= 目标数量累加
+    candidates.sort((a, b) => a.traded_at - b.traded_at);
+    let filledQty = 0, earliest = null, weightedPrice = 0;
+    const matchedTradeIds = [];
+    for (const t of candidates) {
+      matchedTradeIds.push(t.id);
+      filledQty += t.quantity;
+      weightedPrice += t.price * t.quantity;
+      if (earliest === null) earliest = t.traded_at;
+      if (filledQty >= sig.signal_qty) break;
+    }
+    // 滑点 & 延迟
+    const avgPrice = weightedPrice / filledQty;
+    const slippage = Math.round((avgPrice - sig.signal_price) * 10000) / 10000;
+    const delay = earliest - sig.signaled_at;
+    const deviation = Math.round((avgPrice - sig.signal_price) * filledQty * 100) / 100;
+    const status = filledQty >= sig.signal_qty ? 'filled' : 'partial';
+
+    // 逐成交写 signal_fills（每个 matched trade 一条 fill）
+    matchedTradeIds.forEach((tradeId, i) => {
+      fills.push({
+        id: uuid(), user_id: LOCAL_USER_ID, signal_id: sig.id, trade_id: tradeId,
+        match_status: i === matchedTradeIds.length - 1 ? status : 'partial',
+        slippage, delay_seconds: delay, deviation_amount: deviation,
+        match_rule_version: 'v1', created_at: ts,
+      });
+    });
+  }
+
+  // extra（有成交但无信号）
+  const signalWins = new Set(signals.map(s => s.symbol + '|' + s.direction));
+  allTrades.forEach(t => {
+    const inSignalWindow = signals.some(s =>
+      s.symbol === t.symbol && s.direction === t.direction &&
+      t.traded_at >= s.signaled_at - 10 && t.traded_at <= s.signaled_at + 3600 + 30
+    );
+    if (!inSignalWindow) {
+      fills.push({
+        id: uuid(), user_id: LOCAL_USER_ID, signal_id: null, trade_id: t.id,
+        match_status: 'extra', slippage: null, delay_seconds: null,
+        deviation_amount: null, match_rule_version: 'v1', created_at: ts,
+      });
+    }
+  });
+
+  // 批量写入
+  fills.forEach(f => {
+    run(`INSERT INTO signal_fills (id, user_id, signal_id, trade_id, match_status, slippage, delay_seconds, deviation_amount, match_rule_version, created_at)
+         VALUES ($id, $u, $sid, $tid, $s, $sl, $d, $dev, $v, $ts)`, {
+      $id: f.id, $u: f.user_id, $sid: f.signal_id, $tid: f.trade_id,
+      $s: f.match_status, $sl: f.slippage, $d: f.delay_seconds,
+      $dev: f.deviation_amount, $v: f.match_rule_version, $ts: f.created_at,
+    });
+  });
+
+  return { signals, fills };
+}
+
+// ---------- computeAttribution ----------
+function computeAttribution() {
+  const sigCount = q1('SELECT COUNT(*) c FROM signals WHERE user_id=$u', { $u: LOCAL_USER_ID }).c;
+  if (!sigCount) return null;
+
+  const f = q(`SELECT sf.*, s.symbol, s.direction, s.signal_price, s.signal_qty, s.signaled_at, t.price AS trade_price, t.quantity AS trade_qty
+               FROM signal_fills sf
+               LEFT JOIN signals s ON s.id = sf.signal_id
+               LEFT JOIN trades t ON t.id = sf.trade_id
+               WHERE sf.user_id=$u`, { $u: LOCAL_USER_ID });
+
+  const filled = f.filter(x => x.match_status === 'filled');
+  const partials = f.filter(x => x.match_status === 'partial');
+  const missed = f.filter(x => x.match_status === 'missed');
+  const extra = f.filter(x => x.match_status === 'extra');
+  const totalSignals = sigCount;
+  const execRate = filled.length / totalSignals;
+  const missRate = missed.length / totalSignals;
+
+  // 滑点分布（对信号去重：每个 signal_id 取最后一条 fill 的 slippage）
+  const sigLast = {};
+  f.forEach(x => { if (x.signal_id) sigLast[x.signal_id] = x; });
+  const slipArr = Object.values(sigLast).filter(x => x.slippage !== null && x.match_status !== 'missed');
+  const slipBuckets = [
+    { label: '≤0', test: v => v <= 0, count: 0 },
+    { label: '0–0.5%', test: v => v > 0 && v <= 0.005, count: 0 },
+    { label: '0.5–2%', test: v => v > 0.005 && v <= 0.02, count: 0 },
+    { label: '>2%', test: v => v > 0.02, count: 0 },
+  ];
+  slipArr.forEach(x => {
+    // slippage 是价格差绝对值，归一化为 %：slippage / signal_price
+    const pct = x.slippage / x.signal_price;
+    const b = slipBuckets.find(b => b.test(pct)); if (b) b.count++;
+  });
+
+  // 平均滑点（简单均值；加权需额外查 trades 量）
+  const avgSlip = slipArr.length ? slipArr.reduce((s, x) => s + x.slippage, 0) / slipArr.length : 0;
+
+  // 延迟分布（秒）
+  const delayArr = Object.values(sigLast).filter(x => x.delay_seconds !== null);
+  const delayBuckets = [
+    { label: '≤30s', test: d => d <= 30, count: 0 },
+    { label: '30–120s', test: d => d > 30 && d <= 120, count: 0 },
+    { label: '2–10min', test: d => d > 120 && d <= 600, count: 0 },
+    { label: '>10min', test: d => d > 600, count: 0 },
+  ];
+  delayArr.forEach(x => { const b = delayBuckets.find(b => b.test(x.delay_seconds)); if (b) b.count++; });
+
+  // 执行偏差总金额
+  const totalDev = Math.round(f.reduce((s, x) => s + (x.deviation_amount || 0), 0) * 100) / 100;
+
+  // 个股偏差 Top5
+  const bySym = {};
+  f.forEach(x => {
+    if (!x.signal_id || x.deviation_amount === null) return;
+    (bySym[x.symbol] = bySym[x.symbol] || { symbol: x.symbol, pnl: 0, abs: 0 }).pnl += x.deviation_amount;
+    bySym[x.symbol].abs = Math.abs(bySym[x.symbol].pnl);
+  });
+  const topDev = Object.values(bySym).sort((a, b) => b.abs - a.abs).slice(0, 5)
+    .map(s => ({ ...s, pnl: Math.round(s.pnl * 100) / 100 }));
+
+  return {
+    totalSignals, execRate, missRate, avgSlip, totalDev,
+    filledCount: filled.length, missedCount: missed.length, partialCount: partials.length,
+    slipBuckets, delayBuckets, delayArr: delayArr.length, extraCount: extra.length,
+    topDev, f, sigLast,
+  };
+}
+
+// ---------- 模拟信号（固定种子，演示用；mulberry32 见 db.js） ----------
+const MOCK_STOCKS = [
+  ['600519', '贵州茅台', 1480, 1720], ['000001', '平安银行', 11.2, 13.1],
+  ['300750', '宁德时代', 182, 218], ['601318', '中国平安', 45, 54],
+  ['000858', '五粮液', 122, 148], ['002594', '比亚迪', 232, 276],
+  ['600036', '招商银行', 32, 39.5], ['601899', '紫金矿业', 17.5, 22],
+  ['300059', '东方财富', 15, 19.5], ['688981', '中芯国际', 84, 99],
+];
+
+function generateMockSignals() {
+  // 依赖 trades 表已有交易（模拟交割单数据）
+  const trades = q('SELECT * FROM trades WHERE user_id=$u ORDER BY traded_at', { $u: LOCAL_USER_ID });
+  if (!trades.length) { alert('请先生成/导入模拟成交数据'); return; }
+
+  const rnd = mulberry32(987654);
+  const nowTs = now();
+  const signals = [];
+
+  // 已有 trades 的 symbol + direction 作为信号基底
+  const byKey = {};
+  trades.forEach(t => {
+    const k = t.symbol + '|' + t.direction;
+    (byKey[k] = byKey[k] || []).push(t);
+  });
+
+  Object.entries(byKey).forEach(([key, arr]) => {
+    if (rnd() < 0.85) {
+      arr.forEach(t => {
+        // 信号时间在成交时间之前 0~60 秒（模拟提前发信号）
+        const offset = Math.floor(rnd() * 60);
+        // 故意埋入一些漏跟单（信号不对应任何成交——选一个独特的信号时间，窗口外）
+        const miss = rnd() < 0.12;
+        const priceBase = t.price * (miss ? 1.003 : 1); // 漏跟单略抬价避免匹配
+        signals.push({
+          id: uuid(), user_id: LOCAL_USER_ID, platform: rnd() < 0.5 ? 'joinquant' : 'qmt',
+          symbol: t.symbol, direction: t.direction,
+          signal_price: Math.round(priceBase * 100) / 100,
+          signal_qty: t.quantity,
+          signaled_at: t.traded_at - offset,
+          strategy_name: `mock_${t.direction}_${t.symbol}`, backtest_ref: 'mock_backtest',
+          import_batch_id: null, created_at: nowTs,
+        });
+      });
+    }
+  });
+
+  // 额外生成 5 条 missed 信号（窗口内无成交，故意拉远时间）
+  for (let i = 0; i < 5; i++) {
+    const s = MOCK_STOCKS[Math.floor(rnd() * MOCK_STOCKS.length)];
+    const dt = new Date(2026, 8 + Math.floor(rnd() * 2), 1 + Math.floor(rnd() * 25), 9 + Math.floor(rnd() * 3), 15 + Math.floor(rnd() * 45));
+    signals.push({
+      id: uuid(), user_id: LOCAL_USER_ID, platform: rnd() < 0.5 ? 'joinquant' : 'qmt',
+      symbol: s[0], direction: rnd() < 0.5 ? 'buy' : 'sell',
+      signal_price: Math.round((s[2] + rnd() * (s[3] - s[2])) * 100) / 100,
+      signal_qty: 100 + Math.floor(rnd() * 500),
+      signaled_at: Math.floor(dt.getTime() / 1000),
+      strategy_name: `missed_mock_${i}`, backtest_ref: 'mock_backtest',
+      import_batch_id: null, created_at: nowTs,
+    });
+  }
+
+  // 落库（去重：同一 symbol+time+direction）
+  run('DELETE FROM signals');
+  run('DELETE FROM signal_fills');
+  signals.forEach(s => run(`INSERT INTO signals (id, user_id, platform, symbol, direction, signal_price, signal_qty, signaled_at, strategy_name, backtest_ref, import_batch_id, created_at)
+    VALUES ($id, $u, $p, $s, $d, $sp, $sq, $st, $sn, $br, $ib, $ct)`, {
+    $id: s.id, $u: s.user_id, $p: s.platform, $s: s.symbol, $d: s.direction,
+    $sp: s.signal_price, $sq: s.signal_qty, $st: s.signaled_at,
+    $sn: s.strategy_name, $br: s.backtest_ref, $ib: s.import_batch_id, $ct: s.created_at,
+  }));
+
+  autoMatch();
+  alert(`已播种 ${signals.length} 条模拟信号（含 missed）+ autoMatch 完成`);
+}
+
+// ---------- 最近一次导入的识别结果（供页面展示，可审计） ----------
+let LAST_IMPORT = null;
+
+function sampleSignalCSV() {
+  // 由现有成交反推信号（时间提前 30 秒），用来验证「零配置识别 + 匹配」整条链路
+  const trades = q('SELECT * FROM trades WHERE user_id=$u ORDER BY traded_at LIMIT 5', { $u: LOCAL_USER_ID });
+  if (!trades.length) return null;
+  const pad = n => String(n).padStart(2, '0');
+  const head = '委托编号,委托日期,委托时间,证券代码,证券名称,买卖方向,委托价格,委托数量,成交金额,手续费';
+  const rows = trades.map((t, i) => {
+    const d = new Date((t.traded_at - 30) * 1000);
+    const date = `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
+    const time = `${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
+    const suffix = /^(6|9)/.test(t.symbol) ? '.SH' : '.SZ';
+    return [
+      `E${String(i + 1).padStart(4, '0')}`, date, time, `${t.symbol}${suffix}`, t.symbol_name || '',
+      t.direction === 'buy' ? '买入' : '卖出', (t.price * 0.998).toFixed(2), t.quantity, '', '',
+    ].join(',');
+  });
+  return [head, ...rows].join('\n');
+}
+
+function downloadSampleCSV() {
+  const text = sampleSignalCSV();
+  if (!text) { alert('请先导入或生成交割单数据，示例信号需要基于现有成交构造'); return; }
+  const blob = new Blob(['\uFEFF' + text], { type: 'text/csv;charset=utf-8' });
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = '示例信号_聚宽风格.csv';
+  a.click();
+  URL.revokeObjectURL(a.href);
+}
+
+// ---------- signal CSV 文件导入 ----------
+async function handleSignalFile(file) {
+  const buf = await file.arrayBuffer();
+  const text = new TextDecoder('utf-8').decode(buf);
+  const res = parseSignalsCSV(text, 'csv');
+
+  if (!res.ok.length) {
+    LAST_IMPORT = { ok: 0, err: res.errors.length, dup: 0, mapping: res.mapping, unmapped: res.unmapped, errors: res.errors.slice(0, 5) };
+    alert('无有效信号行\n' + res.errors.map(e => `行${e.行号}: ${e.原因}`).join('\n'));
+    return 0;
+  }
+
+  const ts = now();
+  const batchId = uuid();
+  res.ok.forEach(s => {
+    run(`INSERT INTO signals (id, user_id, platform, symbol, direction, signal_price, signal_qty, signaled_at, strategy_name, backtest_ref, import_batch_id, created_at)
+      VALUES ($id, $u, $p, $s, $d, $sp, $sq, $st, $sn, $br, $ib, $ct)`, {
+      $id: s.id, $u: s.user_id, $p: s.platform, $s: s.symbol, $d: s.direction,
+      $sp: s.signal_price, $sq: s.signal_qty, $st: s.signaled_at,
+      $sn: s.strategy_name, $br: s.backtest_ref, $ib: batchId, $ct: ts,
+    });
+  });
+
+  autoMatch();
+  LAST_IMPORT = { ok: res.ok.length, err: res.errors.length, dup: res.dupCount || 0, mapping: res.mapping, unmapped: res.unmapped, errors: res.errors.slice(0, 5) };
+  alert(`信号导入成功 ${res.ok.length} 条（失败 ${res.errors.length} 行，重复剔除 ${res.dupCount || 0} 行）\n\n字段识别：${res.mapping || '无'}`);
+  return res.ok.length;
+}
+
+// ---------- renderSignal 页面 ----------
+function renderSignal(el) {
+  const signals = q('SELECT * FROM signals WHERE user_id=$u ORDER BY signaled_at DESC', { $u: LOCAL_USER_ID });
+  const attr = computeAttribution();
+
+  if (!signals.length) {
+    el.innerHTML = `
+    <div class="p-6">
+      <div class="bg-white rounded-2xl border border-dashed border-slate-300 p-16 text-center">
+        <span class="inline-block text-xs bg-indigo-50 text-indigo-600 rounded-full px-3 py-1 mb-4">P1 · 三层对照模块</span>
+        <div class="text-lg font-semibold text-slate-700 mb-2">回测预期 vs 信号执行 vs 真实成交</div>
+        <p class="text-sm text-slate-500 max-w-lg mx-auto mb-5">导入你的信号 CSV（聚宽/掘金/QMT 通用），或一键生成模拟信号体验完整三层对照。输出信号执行率、漏跟单率、滑点分布、延迟分布、个股偏差归因。</p>
+        <div class="flex justify-center gap-3">
+          <input type="file" id="sig-file" accept=".csv" class="hidden">
+          <button onclick="document.getElementById('sig-file').click()" class="px-4 py-2 bg-indigo-600 text-white rounded-lg text-sm hover:bg-indigo-700">上传信号 CSV</button>
+          <button id="gen-sig" class="px-4 py-2 bg-white border border-slate-300 rounded-lg text-sm hover:bg-slate-50">生成模拟信号数据</button>
+          <button id="dl-sample" class="px-4 py-2 bg-white border border-slate-300 rounded-lg text-sm hover:bg-slate-50">下载示例 CSV</button>
+        </div>
+        <p class="text-xs text-slate-400 mt-4">表头按语义识别，不看列数：聚宽 / 掘金 / QMT 导出可直接读，代码带 .SH/.SZ 后缀、数量带「手」、价格含千分位均可识别</p>
+      </div>
+    </div>`;
+    el.querySelector('#gen-sig').onclick = () => { generateMockSignals(); renderSignal(el); };
+    el.querySelector('#dl-sample').onclick = () => downloadSampleCSV();
+    el.querySelector('#sig-file').onchange = async e => { await handleSignalFile(e.target.files[0]); renderSignal(el); };
+    return;
+  }
+
+  // 每个 signal 取一条 fill 代表（filled 优先）
+  const sigRep = {};
+  attr.f.forEach(x => { if (x.signal_id && !sigRep[x.signal_id]) sigRep[x.signal_id] = x; });
+  const repRows = Object.values(sigRep).sort((a, b) => (b.signaled_at || 0) - (a.signaled_at || 0));
+
+  const maxSlip = Math.max(...attr.slipBuckets.map(b => b.count), 1);
+  const maxDelay = Math.max(...attr.delayBuckets.map(b => b.count), 1);
+  const stCls = s => s === 'filled' ? 'bg-emerald-50 text-emerald-600' : s === 'missed' ? 'bg-red-50 text-red-600' : s === 'partial' ? 'bg-amber-50 text-amber-600' : 'bg-slate-100 text-slate-500';
+  const stTxt = s => s === 'filled' ? '✓ 已成交' : s === 'missed' ? '✗ 漏跟单' : s === 'partial' ? '△ 部分' : '无信号成交';
+  const dirTxt = d => d === 'buy' ? '<span class="text-red-600">买入</span>' : '<span class="text-green-600">卖出</span>';
+
+  el.innerHTML = `
+  <div class="p-6 space-y-6">
+    ${LAST_IMPORT ? `<div class="bg-amber-50 border border-amber-200 rounded-xl p-4">
+      <div class="flex items-center gap-2">
+        <span class="text-sm font-medium text-amber-700">最近一次导入的字段识别结果</span>
+        <button id="imp-close" class="ml-auto text-amber-500 hover:text-amber-700 leading-none text-lg">×</button>
+      </div>
+      <div class="mt-1 text-sm text-slate-700">成功 ${LAST_IMPORT.ok} 条 · 失败 ${LAST_IMPORT.err} 行${LAST_IMPORT.dup ? ` · 重复剔除 ${LAST_IMPORT.dup} 行` : ''}</div>
+      <div class="mt-1 text-xs text-slate-500 font-mono">${esc(LAST_IMPORT.mapping || '字段映射未识别')}</div>
+      ${(LAST_IMPORT.unmapped && LAST_IMPORT.unmapped.length) ? `<div class="mt-1 text-xs text-slate-400">已忽略噪音列：${LAST_IMPORT.unmapped.map(esc).join('、')}</div>` : ''}
+      ${(LAST_IMPORT.errors && LAST_IMPORT.errors.length) ? `<div class="mt-1 text-xs text-red-500">${LAST_IMPORT.errors.map(e => `行${e.行号} ${esc(e.原因)}`).join('；')}</div>` : ''}
+    </div>` : ''}
+    <!-- 顶部三层对照说明 + 导入 -->
+    <div class="grid grid-cols-1 lg:grid-cols-4 gap-4">
+      <div class="lg:col-span-3 bg-white rounded-xl border border-slate-200 p-5">
+        <h3 class="font-semibold mb-2">三层对照说明</h3>
+        <p class="text-sm text-slate-500 leading-relaxed">
+          <span class="font-medium text-slate-700">回测预期</span> → <span class="font-medium text-slate-700">信号执行</span> → <span class="font-medium text-slate-700">真实成交</span>，逐笔审计「信号到了却没成交」「执行价偏离信号价」「延迟过大」的断层位置。匹配规则版本 <code class="text-xs bg-slate-100 px-1 rounded">v1</code>：同一标的 + 同方向 + 成交时间窗口 [0, +3600s]。全部确定性计算，不引入 LLM。
+        </p>
+      </div>
+      <div class="bg-white rounded-xl border border-slate-200 p-5">
+        <h3 class="font-semibold mb-3">信号导入</h3>
+        <input type="file" id="sig-file" accept=".csv" class="hidden">
+        <div class="space-y-2">
+          <button onclick="document.getElementById('sig-file').click()" class="w-full px-3 py-2 bg-indigo-600 text-white rounded-lg text-sm hover:bg-indigo-700">上传信号 CSV</button>
+          <button id="gen-sig" class="w-full px-3 py-2 bg-white border border-slate-300 rounded-lg text-sm hover:bg-slate-50">生成模拟信号数据</button>
+          <button id="dl-sample" class="w-full px-3 py-2 bg-white border border-slate-300 rounded-lg text-sm hover:bg-slate-50">下载示例 CSV</button>
+        </div>
+        <p class="text-xs text-slate-400 mt-2">表头按语义识别，不依赖列数与列序；聚宽 / 掘金 / QMT 导出可直接读</p>
+      </div>
+    </div>
+
+    <!-- KPI 卡 -->
+    <div class="grid grid-cols-2 md:grid-cols-3 xl:grid-cols-6 gap-3">
+      ${[
+        ['信号总数', attr.totalSignals, 'text-slate-800', 'sig-total', `${attr.totalSignals} 条信号`],
+        ['执行率', fmtPct(attr.execRate), 'text-emerald-600', 'exec-rate', `${attr.filledCount + attr.partialCount} 已成交 / ${attr.totalSignals}`],
+        ['漏跟单率', fmtPct(attr.missRate), attr.missRate > 0.25 ? 'text-red-600' : 'text-amber-500', 'miss-rate', `${attr.missedCount} 条漏跟单`],
+        ['平均滑点', attr.avgSlip === 0 ? '—' : fmtMoney(attr.avgSlip), 'text-slate-800', 'avg-slip', `均价差绝对值`],
+        ['偏差总金额', fmtMoney(attr.totalDev), attr.totalDev > 0 ? 'text-red-600' : attr.totalDev < 0 ? 'text-green-600' : 'text-slate-800', 'total-dev', `SUM(slippage × qty)`],
+        ['无信号成交', attr.extraCount, 'text-slate-800', 'extra', `${attr.extraCount} 笔不在任何信号窗口内`],
+      ].map(([label, value, cls, key, sub]) => `
+        <button class="kpi-card bg-white rounded-xl border border-slate-200 p-4 text-left hover:border-indigo-300 hover:shadow-sm transition" data-trace="${key}">
+          <div class="text-xs text-slate-500">${label}</div>
+          <div class="text-xl font-bold mt-1 ${cls}">${value}</div>
+          <div class="text-xs text-slate-400 mt-1">${sub}</div>
+        </button>`).join('')}
+    </div>
+
+    <div class="grid grid-cols-1 lg:grid-cols-2 gap-4">
+      <!-- 滑点分布 -->
+      <div class="bg-white rounded-xl border border-slate-200 p-5">
+        <h3 class="font-semibold text-sm mb-4">滑点分布（按成交价/信号价偏差率）</h3>
+        <div class="space-y-3">${attr.slipBuckets.map(b => `
+          <div class="flex items-center gap-3">
+            <span class="w-24 text-xs text-slate-500 text-right">${b.label}</span>
+            <div class="flex-1 h-6 bg-slate-100 rounded overflow-hidden">
+              <div class="h-full bg-indigo-400 rounded" style="width:${b.count / maxSlip * 100}%"></div>
+            </div>
+            <span class="w-10 text-xs text-slate-600 text-right">${b.count}</span>
+          </div>`).join('')}
+        </div>
+      </div>
+      <!-- 延迟分布 -->
+      <div class="bg-white rounded-xl border border-slate-200 p-5">
+        <h3 class="font-semibold text-sm mb-4">延迟分布（成交时间 − 信号时间）</h3>
+        <div class="space-y-3">${attr.delayBuckets.map(b => `
+          <div class="flex items-center gap-3">
+            <span class="w-24 text-xs text-slate-500 text-right">${b.label}</span>
+            <div class="flex-1 h-6 bg-slate-100 rounded overflow-hidden">
+              <div class="h-full bg-violet-400 rounded" style="width:${b.count / maxDelay * 100}%"></div>
+            </div>
+            <span class="w-10 text-xs text-slate-600 text-right">${b.count}</span>
+          </div>`).join('')}
+        </div>
+      </div>
+    </div>
+
+    <!-- 个股偏差 Top5 -->
+    <div class="bg-white rounded-xl border border-slate-200 p-5">
+      <h3 class="font-semibold text-sm mb-3">个股偏差 Top5（按 |deviation| 排序）</h3>
+      <div class="overflow-x-auto"><table class="min-w-full text-sm">
+        <thead class="bg-slate-50 text-slate-500 text-xs"><tr>
+          ${['代码', '偏差总额', '|偏差|', '涉及信号数'].map(h => `<th class="px-4 py-2 text-left font-medium">${h}</th>`).join('')}
+        </tr></thead>
+        <tbody>${attr.topDev.length ? attr.topDev.map(s => `<tr class="border-t border-slate-100">
+          <td class="px-4 py-2 font-mono">${s.symbol}</td>
+          <td class="px-4 py-2 ${s.pnl >= 0 ? 'text-red-600' : 'text-green-600'}">${s.pnl >= 0 ? '+' : ''}${fmtMoney(s.pnl)}</td>
+          <td class="px-4 py-2 text-slate-700">${fmtMoney(s.abs)}</td>
+          <td class="px-4 py-2 text-slate-500">${s.count || '—'}</td>
+        </tr>`).join('') : '<tr><td colspan="4" class="px-4 py-6 text-center text-slate-400">无偏差数据</td></tr>'}
+        </tbody></table></div>
+    </div>
+
+    <!-- 逐笔对照表 -->
+    <div class="bg-white rounded-xl border border-slate-200">
+      <h3 class="font-semibold px-5 pt-4 pb-2">逐笔对照表（信号 → 成交）</h3>
+      <div class="overflow-x-auto"><table class="min-w-full text-sm">
+        <thead class="bg-slate-50 text-slate-500 text-xs"><tr>
+          ${['信号时间', '标的', '方向', '信号价', '目标量', '成交价', '成交时间', '滑点', '延迟', '状态'].map(h => `<th class="px-3 py-2 text-left font-medium">${h}</th>`).join('')}
+        </tr></thead>
+        <tbody>${repRows.length ? repRows.map(x => `<tr class="border-t border-slate-100">
+          <td class="px-3 py-2 whitespace-nowrap text-xs">${fmtDateTime(x.signaled_at)}</td>
+          <td class="px-3 py-2 font-mono">${x.symbol}</td>
+          <td class="px-3 py-2">${dirTxt(x.sig_dir)}</td>
+          <td class="px-3 py-2 text-right">${fmtMoney(x.signal_price)}</td>
+          <td class="px-3 py-2 text-right">${x.signal_qty || '-'}</td>
+          <td class="px-3 py-2 text-right">${x.trade_price !== null && x.trade_price !== undefined ? fmtMoney(x.trade_price) : '<span class="text-slate-300">—</span>'}</td>
+          <td class="px-3 py-2 text-xs whitespace-nowrap">${x.traded_at ? fmtDateTime(x.traded_at) : '<span class="text-slate-300">—</span>'}</td>
+          <td class="px-3 py-2 text-right ${x.slippage > 0 ? 'text-red-600' : x.slippage < 0 ? 'text-green-600' : 'text-slate-600'}">${x.slippage !== null ? fmtMoney(x.slippage) : '<span class="text-slate-300">—</span>'}</td>
+          <td class="px-3 py-2 text-right text-xs">${x.delay_seconds !== null ? x.delay_seconds + 's' : '<span class="text-slate-300">—</span>'}</td>
+          <td class="px-3 py-2"><span class="text-xs px-2 py-0.5 rounded ${stCls(x.match_status)}">${stTxt(x.match_status)}</span></td>
+        </tr>`).join('') : '<tr><td colspan="10" class="px-4 py-8 text-center text-slate-400">无对照数据</td></tr>'}
+        </tbody></table></div>
+    </div>
+  </div>`;
+
+  el.querySelector('#gen-sig').onclick = () => { generateMockSignals(); renderSignal(el); };
+  el.querySelector('#dl-sample').onclick = () => downloadSampleCSV();
+  el.querySelector('#sig-file').onchange = async e => { await handleSignalFile(e.target.files[0]); renderSignal(el); };
+  const impClose = el.querySelector('#imp-close');
+  if (impClose) impClose.onclick = () => { LAST_IMPORT = null; renderSignal(el); };
+
+  // KPI 溯源弹窗
+  el.querySelectorAll('.kpi-card').forEach(card => {
+    card.onclick = () => {
+      const key = card.dataset.trace;
+      let title = '', body = '';
+      if (key === 'sig-total') { title = '信号总数明细'; body = `<p class="text-sm text-slate-500 mb-2">共 ${attr.totalSignals} 条信号</p>
+        <table class="min-w-full text-sm"><thead class="bg-slate-50 text-xs"><tr>${['时间','标的','方向','信号价','目标量','平台'].map(h=>`<th class="px-3 py-2 text-left">${h}</th>`).join('')}</tr></thead><tbody>
+        ${signals.map(s=>`<tr class="border-t"><td class="px-3 py-2 text-xs">${fmtDateTime(s.signaled_at)}</td><td class="px-3 py-2 font-mono">${s.symbol}</td><td class="px-3 py-2">${dirTxt(s.direction)}</td><td class="px-3 py-2 text-right">${fmtMoney(s.signal_price)}</td><td class="px-3 py-2 text-right">${s.signal_qty}</td><td class="px-3 py-2 text-xs text-slate-500">${s.platform||'—'}</td></tr>`).join('')}</tbody></table>`; }
+      else if (key === 'exec-rate' || key === 'miss-rate') { title = key === 'exec-rate' ? '执行率溯源' : '漏跟单率溯源';
+        const ms = attr.f.filter(x => x.match_status === 'missed' || x.match_status === 'filled').map(x => {
+          const s = signals.find(s => s.id === x.signal_id); return { ...x, sig_symbol: s?.symbol, sig_dir: s?.direction, sig_time: s?.signaled_at };
+        });
+        body = `<table class="min-w-full text-sm"><thead class="bg-slate-50 text-xs"><tr>${['信号时间','标的','方向','信号价','状态'].map(h=>`<th class="px-3 py-2 text-left">${h}</th>`).join('')}</tr></thead><tbody>
+        ${ms.map(x=>`<tr class="border-t"><td class="px-3 py-2 text-xs">${fmtDateTime(x.sig_time)}</td><td class="px-3 py-2 font-mono">${x.sig_symbol}</td><td class="px-3 py-2">${dirTxt(x.sig_dir)}</td><td class="px-3 py-2 text-right">${fmtMoney(x.signal_price)}</td><td class="px-3 py-2"><span class="text-xs px-2 py-0.5 rounded ${stCls(x.match_status)}">${stTxt(x.match_status)}</span></td></tr>`).join('')}</tbody></table>`; }
+      else if (key === 'avg-slip') { title = '滑点明细';
+        body = `<table class="min-w-full text-sm"><thead class="bg-slate-50 text-xs"><tr>${['标的','方向','信号价','成交价','滑点','延迟'].map(h=>`<th class="px-3 py-2 text-left">${h}</th>`).join('')}</tr></thead><tbody>
+        ${Object.values(attr.sigLast).filter(x=>x.slippage!==null).map(x=>`<tr class="border-t"><td class="px-3 py-2 font-mono">${x.symbol}</td><td class="px-3 py-2">${dirTxt(x.sig_dir)}</td><td class="px-3 py-2 text-right">${fmtMoney(x.signal_price)}</td><td class="px-3 py-2 text-right">${fmtMoney(x.trade_price)}</td><td class="px-3 py-2 text-right ${x.slippage>0?'text-red-600':'text-green-600'}">${fmtMoney(x.slippage)}</td><td class="px-3 py-2 text-right text-xs">${x.delay_seconds}s</td></tr>`).join('')}</tbody></table>`; }
+      else if (key === 'total-dev') { title = '执行偏差明细';
+        body = `<p class="text-sm text-slate-500 mb-2">偏差金额 = (成交价 − 信号价) × 成交数量，正值表示比信号贵（不利），负值表示比信号便宜（有利）</p>
+        <table class="min-w-full text-sm"><thead class="bg-slate-50 text-xs"><tr>${['标的','方向','偏差','延迟'].map(h=>`<th class="px-3 py-2 text-left">${h}</th>`).join('')}</tr></thead><tbody>
+        ${Object.values(attr.sigLast).filter(x=>x.deviation_amount!==null).map(x=>`<tr class="border-t"><td class="px-3 py-2 font-mono">${x.symbol}</td><td class="px-3 py-2">${dirTxt(x.sig_dir)}</td><td class="px-3 py-2 ${x.deviation_amount>0?'text-red-600':'text-green-600'}">${fmtMoney(x.deviation_amount)}</td><td class="px-3 py-2 text-xs">${x.delay_seconds}s</td></tr>`).join('')}</tbody></table>`; }
+      else if (key === 'extra') { title = '无信号成交明细';
+        body = `<p class="text-sm text-slate-500 mb-2">以下 ${attr.extraCount} 笔成交不在任何信号的 ±3600s 窗口内，属于信号外交易</p>`; }
+      openModal({ title: esc(title), bodyHTML: body });
+    };
+  });
+}
+
+
+// ============================================================
+// ===== 拼接文件 8/10：js/llm.js =====
+// ============================================================
+// ============================================================
+// llm.js — LLM 接入层（从 report.js 拆出，架构红线物理隔离）
+//   本模块只允许产出自然语言文本列：summary_text / report_text /
+//   llm_model / llm_prompt_ver（+ 审计元数据 llm_source / llm_note）。
+//   数值列名出现在 LLM 输出即视为越界，validateLLMOutput 拦截回退。
+//   包含：配置读写(localStorage) / OpenAI 兼容调用 / 越界校验 /
+//         合规词表扫描 / 数字溯源自查 / Mock 模板引擎（回退兜底）
+// ============================================================
+
+// ---------- 架构红线：禁止进入 LLM 输出的数值列名（用于 validateLLMOutput） ----------
+const NUMERIC_COLUMN_KEYS = [
+  'win_rate', 'profit_loss', 'discipline_score', 'total_trades',
+  'profit_factor', 'avg_holding_days', 'discipline_violations',
+];
+
+// ---------- Mock LLM 模板引擎：把 JSON 变量注入中文模板 ----------
+// 输入 metricsJson；输出 { summary_text, report_text, llm_model, llm_prompt_ver }
+const RULE_KEY_NAME = {
+  max_position_pct: '单票仓位超限',
+  stop_loss: '止损纪律未执行',
+  no_tail_chase: '尾盘追高买入',
+  t1_check: 'T+1 违规当日买卖',
+  max_weekly_trades: '单周交易次数超上限',
+};
+
+const PROMPT_VER = 'mock-v1';          // 每次 mock 模板升级时递增
+const MOCK_MODEL = 'template-engine';
+
+function ruleName(key) { return RULE_KEY_NAME[key] || key; }
+function fmtDelta(v, digits = 1) {
+  if (v === null || v === undefined) return '持平';
+  if (v > 0) return `+${(v * 100).toFixed(digits)}%`;
+  return `${(v * 100).toFixed(digits)}%`;
+}
+
+function mockGenerateReport(metrics) {
+  const m = metrics;
+
+  // 一句话摘要（30–50 字）
+  const topViolation = m.violations_top3 && m.violations_top3[0];
+  const summaryParts = [];
+  summaryParts.push(`${m.period.slice(5)}月共 ${m.total_trades} 笔成交`);
+  if (m.win_rate !== null) summaryParts.push(`胜率 ${(m.win_rate * 100).toFixed(0)}%`);
+  if (m.profit_factor !== null) summaryParts.push(`盈亏比 ${m.profit_factor.toFixed(2)}`);
+  if (m.discipline_score !== null) summaryParts.push(`纪律执行率 ${(m.discipline_score * 100).toFixed(1)}%`);
+  if (topViolation) summaryParts.push(`${ruleName(topViolation.rule)}是首犯（${topViolation.count} 次）`);
+  const summary_text = summaryParts.join('、') + '。';
+
+  // 约 300–500 字分节报告
+  const sections = [];
+
+  // ① 月度概览
+  let s1 = `【月度概览】\n${m.period} 月共产生 ${m.total_trades} 笔成交流水，`;
+  if (m.closed_trades) {
+    s1 += `其中已配对完整交易 ${m.closed_trades} 笔；净盈亏 ${(m.profit_loss >= 0 ? '+' : '') + fmtMoney(m.profit_loss)} 元。`;
+  }
+  if (m.win_rate !== null && m.profit_factor !== null) {
+    s1 += `胜率 ${fmtPct(m.win_rate)}，盈亏比 ${m.profit_factor.toFixed(2)}${m.profit_factor >= 1.5 ? '，盈利厚度尚可' : m.profit_factor >= 1 ? '，盈亏基本打平' : '，亏损厚度偏大'}。`;
+  }
+  if (m.avg_holding_days !== null) {
+    s1 += `平均持仓周期 ${m.avg_holding_days} 天。`;
+  }
+  const hasMoM = m.mom_delta && (m.mom_delta.profit_loss !== undefined || m.mom_delta.win_rate !== undefined || m.mom_delta.discipline_score !== undefined);
+  if (hasMoM) {
+    const p = m.mom_delta.profit_loss !== undefined ? `盈亏 ${fmtDelta(m.mom_delta.profit_loss)}` : '';
+    const w = m.mom_delta.win_rate !== undefined ? `胜率 ${fmtDelta(m.mom_delta.win_rate)}` : '';
+    const d = m.mom_delta.discipline_score !== undefined ? `纪律 ${fmtDelta(m.mom_delta.discipline_score)}` : '';
+    const parts = [p, w, d].filter(Boolean);
+    if (parts.length) s1 += `环比上月：${parts.join('，')}。`;
+  }
+  sections.push(s1);
+
+  // ② 纪律执行
+  let s2 = `【纪律执行】\n纪律执行率 ${m.discipline_score !== null ? fmtPct(m.discipline_score) : '—'}，期内检测到违规 ${m.discipline_violations} 次。`;
+  if (m.violations_top3 && m.violations_top3.length) {
+    s2 += `Top3 违规集中在：${m.violations_top3.map(v => `${ruleName(v.rule)} ${v.count} 次`).join('、')}。`;
+  }
+  if (m.discipline_score !== null) {
+    if (m.discipline_score >= 0.9) s2 += '整体执行较好，保持目前的规则意识。';
+    else if (m.discipline_score >= 0.75) s2 += '纪律执行率尚在可控区间，但需要盯住高频违规项的改善。';
+    else s2 += '纪律执行率低于 75%，意味着本月约四分之一以上交易触碰了自定规则。';
+  }
+  sections.push(s2);
+
+  // ③ 盈亏归因（标签维度）
+  let s3 = `【盈亏归因】\n按标签维度拆解：`;
+  if (m.tags_pnl && m.tags_pnl.length) {
+    const losers = m.tags_pnl.filter(t => t.pnl < 0).slice(-3).reverse();
+    const winners = m.tags_pnl.filter(t => t.pnl >= 0).slice(0, 3);
+    if (losers.length) {
+      s3 += `亏损侧主要来自 ${losers.map(t => `「${t.tag}」${fmtMoney(t.pnl)}`).join('、')}；`;
+    }
+    if (winners.length) {
+      s3 += `盈利侧主要贡献是 ${winners.map(t => `「${t.tag}」+${fmtMoney(t.pnl)}`).join('、')}。`;
+    }
+  } else {
+    s3 += '账本上尚未给成交打标签，暂时无法做行为维度归因。可在「复盘账本」逐笔补上标签。';
+  }
+  sections.push(s3);
+
+  // ④ 重复犯错模式识别（从违规 Top3 + 亏损标签推断）
+  let s4 = `【重复犯错模式识别】\n`;
+  if (m.violations_top3 && m.violations_top3.length) {
+    if (m.violations_top3.some(v => v.rule === 'no_tail_chase')) {
+      s4 += '尾盘追高是本月最明显的行为特征——在 14:50 之后买入了多笔交易，容易追进高点。';
+    }
+    if (m.violations_top3.some(v => v.rule === 'max_weekly_trades')) {
+      s4 += '单周交易次数多次超过上限，说明有过度交易倾向，需要警惕。';
+    }
+    if (m.violations_top3.some(v => v.rule === 'stop_loss')) {
+      s4 += '多笔亏损交易未按 -7% 止损纪律执行，止损纪律是本月最大短板。';
+    }
+    if (m.violations_top3.some(v => v.rule === 'max_position_pct')) {
+      s4 += '曾出现单票仓位超过假设本金 30% 的情况，存在集中持仓风险。';
+    }
+    if (m.violations_top3.some(v => v.rule === 't1_check')) {
+      s4 += '出现 T+1 违规，可能是数据异常或手工配对缺口，建议排查。';
+    }
+  } else {
+    s4 += '本月未检测到任何纪律违规行为，是理想状态，继续保持。';
+  }
+  sections.push(s4);
+
+  // ⑤ 下月建议
+  let s5 = `【下月建议】\n`;
+  const topRule = m.violations_top3 && m.violations_top3[0];
+  if (topRule) {
+    const r = topRule.rule;
+    if (r === 'no_tail_chase') s5 += '① 把「14:50 后禁止买入」固化到交易前检查清单，买入前扫一眼时钟即可拦截；';
+    else if (r === 'max_weekly_trades') s5 += '① 给每周围一个「第 10 笔之后强制冷静 24 小时」的硬规则；';
+    else if (r === 'stop_loss') s5 += '① 给每笔买入强制挂一个止损提醒（-7% 无条件执行），不要扛；';
+    else if (r === 'max_position_pct') s5 += '① 单票仓位严格控制在 30% 以内，超过即视为违规；';
+  }
+  if (m.win_rate !== null && m.win_rate < 0.5) {
+    s5 += '② 当前胜率低于 50%，建议降低交易频次、把仓位让给胜率更高的机会；';
+  }
+  if (m.profit_factor !== null && m.profit_factor < 1.2) {
+    s5 += '③ 盈亏比偏低，注意亏损单是否砍得太慢或盈利单走得太早；';
+  }
+  s5 += '④ 所有数字可复算，所有结论可追溯——本体检报告每一个指标都来自本地确定性计算，LLM 只负责把数字写成自然语言，没有任何主观预测。';
+
+  const report_text = sections.join('\n\n') + '\n\n' + s5;
+
+  return {
+    summary_text,
+    report_text,
+    llm_model: MOCK_MODEL,
+    llm_prompt_ver: PROMPT_VER,
+  };
+}
+
+// ---------- 真实 LLM 接入（OpenAI 兼容 chat/completions） ----------
+// 纯前端本地优先：API Key 只存本机 localStorage，只发往用户填写的 Base URL
+// 架构红线：LLM 的唯一输入是 metrics_json；只取两个自然语言字段，数值列一律不碰
+const LLM_CFG_KEY = 'trae_llm_cfg_v1';
+
+const LLM_PROVIDERS = {
+  // 模型名以官方 /v1/models 实际清单为准：deepseek-flash / deepseek-v4-pro
+  // （旧的 deepseek-chat 仍可作别名使用，但官方已不列，故默认改为 deepseek-flash）
+  deepseek: { label: 'DeepSeek', baseUrl: 'https://api.deepseek.com/v1', model: 'deepseek-flash' },
+  ark: { label: '豆包 / 火山方舟', baseUrl: 'https://ark.cn-beijing.volces.com/api/v3', model: '' },
+  custom: { label: '自定义（OpenAI 兼容）', baseUrl: '', model: '' },
+};
+
+function llmConfig() {
+  try {
+    const raw = localStorage.getItem(LLM_CFG_KEY);
+    const c = raw ? JSON.parse(raw) : {};
+    return {
+      provider: c.provider || 'deepseek',
+      baseUrl: c.baseUrl || '',
+      model: c.model || '',
+      apiKey: c.apiKey || '',
+    };
+  } catch (_) {
+    return { provider: 'deepseek', baseUrl: '', model: '', apiKey: '' };
+  }
+}
+
+function saveLLMConfig(cfg) { localStorage.setItem(LLM_CFG_KEY, JSON.stringify(cfg)); }
+function clearLLMConfig() { localStorage.removeItem(LLM_CFG_KEY); }
+
+function llmReady(cfg) { return !!(cfg.baseUrl && cfg.model && cfg.apiKey); }
+
+const LIVE_PROMPT_VER = 'live-v1';   // 真实 LLM 的 prompt 版本（改动 SYSTEM 提示词时递增）
+
+const LLM_SYSTEM_PROMPT = [
+  '你是 A 股散户的交易复盘助手。用户会给你一段 JSON，内容是他某个月自己账户的成交统计。',
+  '必须严格遵守：',
+  '1. 只能使用 JSON 中已经给出的数字，禁止推算、估算、编造任何新的数字；',
+  '2. 禁止预测收益、禁止推荐个股、禁止出现「稳赚 / 必涨 / 保证收益 / 年化收益」等承诺性表述；',
+  '3. 不评价个股基本面好坏，只评价用户自己的交易行为与纪律执行；',
+  '4. 输出必须是一个 JSON 对象，且只包含两个字段：',
+  '   summary_text：30–60 字的一句话摘要；',
+  '   report_text：300–500 字，分「月度概览 / 纪律执行 / 盈亏归因 / 下月建议」四节，节标题用【】包裹，节与节之间用换行分隔。',
+  '不要输出 JSON 以外的任何内容。',
+].join('\n');
+
+// 组装请求体（测试连接与正式生成共用）
+function buildLLMBody(cfg, messages, withJsonFormat, maxTokens) {
+  const body = { model: cfg.model, temperature: 0.2, max_tokens: maxTokens, messages };
+  if (withJsonFormat) body.response_format = { type: 'json_object' };
+  return body;
+}
+
+async function postLLM(cfg, body) {
+  const url = cfg.baseUrl.replace(/\/+$/, '') + '/chat/completions';
+  return fetch(url, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'Authorization': 'Bearer ' + cfg.apiKey,
+    },
+    body: JSON.stringify(body),
+  });
+}
+
+// 连通性自检：只花个位数 token，用于设置面板「测试连接」
+async function testLLMConnection() {
+  const cfg = llmConfig();
+  if (!llmReady(cfg)) return { ok: false, msg: 'Base URL / 模型名 / API Key 三项都要填' };
+  try {
+    let resp = await postLLM(cfg, buildLLMBody(cfg,
+      [{ role: 'user', content: '只回复两个字：正常' }], false, 16));
+    if (!resp.ok) {
+      const t = await resp.text();
+      return { ok: false, msg: `HTTP ${resp.status}：${t.slice(0, 160)}` };
+    }
+    const data = await resp.json();
+    const txt = data.choices && data.choices[0] && data.choices[0].message ? data.choices[0].message.content : '';
+    return { ok: true, msg: `连通正常，返回：${String(txt).trim().slice(0, 20) || '(空)'}` };
+  } catch (e) {
+    return { ok: false, msg: `请求失败：${e.message}。若提示 CORS / Failed to fetch，说明该接口不允许浏览器跨域，请改填可跨域的代理地址。` };
+  }
+}
+
+async function callLLMAPI(metricsJson) {
+  const cfg = llmConfig();
+  const mock = mockGenerateReport(metricsJson);
+
+  if (!llmReady(cfg)) {
+    return { ...mock, llm_source: 'mock', llm_note: '未配置 API，使用本地模板引擎' };
+  }
+
+  const messages = [
+    { role: 'system', content: LLM_SYSTEM_PROMPT },
+    { role: 'user', content: '以下是该用户本月的交易统计 JSON（唯一数据来源）：\n' + JSON.stringify(metricsJson) },
+  ];
+
+  let resp;
+  try {
+    resp = await postLLM(cfg, buildLLMBody(cfg, messages, true, 1200));
+    // 部分模型不支持 response_format，400 时去掉该参数重试一次
+    if (resp.status === 400) resp = await postLLM(cfg, buildLLMBody(cfg, messages, false, 1200));
+    if (!resp.ok) {
+      const t = await resp.text();
+      throw new Error(`HTTP ${resp.status} ${t.slice(0, 160)}`);
+    }
+  } catch (e) {
+    return { ...mock, llm_source: 'mock', llm_note: 'LLM 调用失败，已回退模板引擎：' + e.message };
+  }
+
+  let content = '';
+  try {
+    const data = await resp.json();
+    content = data.choices && data.choices[0] && data.choices[0].message ? data.choices[0].message.content : '';
+  } catch (e) {
+    return { ...mock, llm_source: 'mock', llm_note: '响应不是合法 JSON，已回退模板引擎：' + e.message };
+  }
+
+  content = String(content || '').replace(/^\s*```(?:json)?/i, '').replace(/```\s*$/, '').trim();
+  if (!content) return { ...mock, llm_source: 'mock', llm_note: 'LLM 返回空内容，已回退模板引擎' };
+
+  // 红线拦截：LLM 输出里出现数值列名 → 视为越界，直接回退
+  if (!validateLLMOutput(content)) {
+    return { ...mock, llm_source: 'mock', llm_note: 'LLM 输出越界（含数值列名），已拦截并回退模板引擎' };
+  }
+
+  let obj = null;
+  try { obj = JSON.parse(content); } catch (_) { obj = null; }
+  const summary = obj ? (obj.summary_text || obj.summary || '') : '';
+  const report = obj ? (obj.report_text || obj.report || '') : content;
+  if (!report) return { ...mock, llm_source: 'mock', llm_note: 'LLM 未返回 report_text 字段，已回退模板引擎' };
+
+  return {
+    summary_text: summary,
+    report_text: report,
+    llm_model: cfg.model,
+    llm_prompt_ver: LIVE_PROMPT_VER,
+    llm_source: 'remote',
+    llm_note: '',
+  };
+}
+
+// ---------- 数字溯源自查（确定性）：找出文本中无法在 metrics 里对上的数字 ----------
+// 只作提示，不改写内容；用于暴露「LLM 可能编造数字」的风险
+function collectNumbers(obj, out) {
+  if (typeof obj === 'number' && isFinite(obj)) out.push(Math.abs(obj));
+  else if (Array.isArray(obj)) obj.forEach(v => collectNumbers(v, out));
+  else if (obj && typeof obj === 'object') Object.values(obj).forEach(v => collectNumbers(v, out));
+  return out;
+}
+
+function unverifiedNumbers(text, metrics) {
+  if (!text || !metrics) return [];
+  const pool = collectNumbers(metrics, []);
+  // 月份字符串里的年份与月份也算合法来源
+  if (metrics.period) String(metrics.period).split('-').forEach(s => pool.push(Math.abs(+s)));
+
+  const hits = [];
+  const seen = new Set();
+  // 千分位数字（34,314.24）要整体识别后剥掉逗号再比对，
+  // 否则会被拆成 34 与 314.24 两段，双双落在池外造成误报
+  const found = String(text).match(/\d[\d,]*(?:\.\d+)?/g) || [];
+  for (const raw of found) {
+    const n = parseFloat(raw.replace(/,/g, ''));
+    if (!isFinite(n)) continue;
+    if (seen.has(n)) continue;
+    seen.add(n);
+    // 允许直接相等、或按百分比放大 100 倍后相等（0.59 → 59%）
+    const matched = pool.some(v => Math.abs(n - v) <= 0.05 || Math.abs(n - v * 100) <= 0.5);
+    if (!matched) hits.push(raw);
+  }
+  return hits.slice(0, 8);
+}
+
+// ---------- schema 校验层：拒绝含数值列名或 number 类型 key 的 LLM 输出 ----------
+function validateLLMOutput(text) {
+  if (!text || typeof text !== 'string') return false;
+  // 如果返回的是 JSON 字符串，做结构检查
+  try {
+    const obj = JSON.parse(text);
+    const badKeys = NUMERIC_COLUMN_KEYS.filter(k => k in obj);
+    if (badKeys.length) {
+      console.warn('[llm] validateLLMOutput 拒绝：LLM 输出含数值列名', badKeys);
+      return false;
+    }
+  } catch (_) { /* 非 JSON 文本，放行 */ }
+  // 拒绝输出中含明确的数值列名（简单字符串匹配，防 prompt injection）
+  // 注意：模型把越界内容塞进 report_text 字符串时，其引号会被 JSON 转义成 \"，
+  // 直接 includes('"win_rate"') 会漏检（实测 false），所以先把 \" 还原再匹配；
+  // 且要求 key 后面紧跟冒号，避免把正文里「（violations_top3）为空」这类提及误判为越界。
+  const norm = text.replace(/\\"/g, '"');
+  const keyPattern = new RegExp('"(?:' + NUMERIC_COLUMN_KEYS.join('|') + ')"\\s*:');
+  if (keyPattern.test(norm)) {
+    console.warn('[llm] validateLLMOutput 拒绝：文本中含数值列 JSON key');
+    return false;
+  }
+  return true;
+}
+
+// ---------- 合规扫描（确定性词表匹配，不依赖 LLM 自检） ----------
+const COMPLIANCE_BLOCKLIST = [
+  '稳赚', '躺赚', '年化收益', '收益率保证', '翻倍', '牛股', '金股',
+  '带你上车', '跟单', 'AI 选股推荐', 'AI选股推荐', '明日涨停',
+  '抄底逃顶', '胜率保证', '承诺', '保证', '包赚', '保本', '必涨', '零风险',
+  '用我们的用户都赚了',
+];
+
+function complianceScan(reportText, summaryText = '') {
+  const haystack = (reportText || '') + (summaryText || '');
+  const hits = COMPLIANCE_BLOCKLIST.filter(w => haystack.includes(w));
+  if (hits.length) {
+    return JSON.stringify({ status: 'blocked', hits });
+  }
+  return JSON.stringify({ status: 'pass' });
+}
+
+
+// ============================================================
+// ===== 拼接文件 9/10：js/report.js =====
+// ============================================================
+// ============================================================
+// report.js — P1-M5 AI 月度体检报告
+// 架构红线：确定性指标 JSON → LLM 自然语言，严格分层
+//   - 确定性计算层（本文件）：computeMonthlyMetrics / persistReport
+//     只写 metrics_json / win_rate / profit_loss / discipline_score /
+//     total_trades / mom_delta_json / violations_top3 / compliance_scan
+//   - LLM 层（llm.js）：callLLMAPI / mockGenerateReport /
+//     validateLLMOutput / complianceScan / unverifiedNumbers
+//     只产出 report_text / summary_text / llm_model / llm_prompt_ver
+//   - persistReport 内部分两次写入，LLM 返回值永远不进入数值列
+// ============================================================
+
+// ---------- 1. 确定性计算层：computeMonthlyMetrics ----------
+// 输入 period = 'YYYY-MM'；输出结构化指标 JSON（即 LLM 的唯一输入）
+// 每个字段附 SQL 口径注释（风格对齐 analytics.js）
+
+// 内部函数：计算单期核心指标（仅含 profit_loss / win_rate / discipline_score）
+//   —— 用来算 mom_delta，只做一次，不递归，避免栈溢出
+function coreMetricsForPeriod(period, pairs, allTrades, allViolations) {
+  const periodClosed = pairs.closed.filter(c => monthKey(c.closeAt) === period);
+  const closedTrades = periodClosed.length;
+  const profitLoss = closedTrades
+    ? Math.round(periodClosed.reduce((s, c) => s + c.pnl, 0) * 100) / 100
+    : 0;
+  const wins = periodClosed.filter(c => c.pnl > 0);
+  const winRate = closedTrades
+    ? Math.round((wins.length / closedTrades) * 10000) / 10000
+    : null;
+  const totalTrades = allTrades.filter(t => monthKey(t.traded_at) === period).length;
+  const periodViolations = allViolations.filter(v => monthKey(v.violated_at) === period);
+  const violatedSet = new Set(periodViolations.map(v => v.trade_id));
+  const ds = totalTrades ? Math.round((1 - violatedSet.size / totalTrades) * 10000) / 10000 : null;
+  return { profit_loss: profitLoss, win_rate: winRate, discipline_score: ds };
+}
+
+function computeMonthlyMetrics(period) {
+  const trades = q('SELECT * FROM trades WHERE user_id=$u ORDER BY traded_at', { $u: LOCAL_USER_ID });
+  if (!trades.length) {
+    return { period, total_trades: 0, closed_trades: 0 };
+  }
+
+  const pairs = computePairs(trades);
+
+  // 违规数据一次性全量加载（后续按 period 切片）
+  const allViolations = q(
+    `SELECT v.*, r.rule_key FROM rule_violations v JOIN discipline_rules r ON r.id=v.rule_id
+     WHERE v.user_id=$u`,
+    { $u: LOCAL_USER_ID }
+  );
+
+  // 期内成交：SELECT * FROM trades WHERE strftime('%Y-%m', traded_at)=period
+  const periodTrades = trades.filter(t => monthKey(t.traded_at) === period);
+  // 完整交易按平仓日落位（与 analytics.js 月度盈亏口径一致）
+  const periodClosed = pairs.closed.filter(c => monthKey(c.closeAt) === period);
+
+  // total_trades：SELECT COUNT(*) FROM trades WHERE 期内
+  const totalTrades = periodTrades.length;
+  const closedTrades = periodClosed.length;
+
+  // profit_loss：SELECT SUM(pnl) FROM 完整交易 WHERE 期内平仓（含费用已在 FIFO 内扣除）
+  const profitLoss = Math.round(periodClosed.reduce((s, c) => s + c.pnl, 0) * 100) / 100;
+
+  // win_rate：盈利笔数 / 已平仓总笔数
+  const wins = periodClosed.filter(c => c.pnl > 0);
+  const winRate = closedTrades ? Math.round((wins.length / closedTrades) * 10000) / 10000 : null;
+
+  // profit_factor：AVG(盈利) / ABS(AVG(亏损)) —— 盈亏比
+  const losses = periodClosed.filter(c => c.pnl < 0);
+  const avgWin = wins.length ? wins.reduce((s, c) => s + c.pnl, 0) / wins.length : 0;
+  const avgLoss = losses.length ? Math.abs(losses.reduce((s, c) => s + c.pnl, 0) / losses.length) : 0;
+  const profitFactor = avgLoss > 0 ? Math.round((avgWin / avgLoss) * 100) / 100 : null;
+
+  // avg_holding_days：AVG(closeAt - openAt) / 86400 —— 平均持仓天数
+  const avgHoldingDays = closedTrades
+    ? Math.round((periodClosed.reduce((s, c) => s + c.holdingDays, 0) / closedTrades) * 10) / 10
+    : null;
+
+  // 纪律执行率（期内）：1 − 期内违规去重笔数 / 期内交易笔数
+  // SQL 等价：SELECT COUNT(DISTINCT trade_id) FROM rule_violations WHERE strftime('%Y-%m', violated_at)=period
+  const periodViolations = allViolations.filter(v => monthKey(v.violated_at) === period);
+  const violatedSet = new Set(periodViolations.map(v => v.trade_id));
+  const disciplineScoreVal = totalTrades
+    ? Math.round((1 - violatedSet.size / totalTrades) * 10000) / 10000
+    : null;
+
+  // discipline_violations：期内违规总条数（不去重，用于 LLM 描述违规频次）
+  const disciplineViolations = periodViolations.length;
+
+  // violations_top3：按 rule_key 分组计次取前三
+  // SQL：SELECT rule_key, COUNT(*) c FROM rule_violations WHERE 期内 GROUP BY rule_key ORDER BY c DESC LIMIT 3
+  const byRule = {};
+  for (const v of periodViolations) byRule[v.rule_key] = (byRule[v.rule_key] || 0) + 1;
+  const violationsTop3 = Object.entries(byRule)
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, 3)
+    .map(([rule, count]) => ({ rule, count }));
+
+  // mom_delta：与上期（period-1）的环比变化
+  // —— 调一次 coreMetricsForPeriod，不再递归，避免栈溢出
+  const [y, m] = period.split('-').map(Number);
+  const d = new Date(y, m - 2, 1);  // period - 1 month
+  const prevPeriod = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}`;
+  const prev = coreMetricsForPeriod(prevPeriod, pairs, trades, allViolations);
+  const momDelta = {};
+  if (prev.profit_loss !== null && profitLoss !== null) {
+    momDelta.profit_loss = prev.profit_loss !== 0
+      ? Math.round(((profitLoss - prev.profit_loss) / Math.abs(prev.profit_loss)) * 10000) / 10000
+      : null;
+  }
+  if (prev.win_rate !== null && winRate !== null) {
+    momDelta.win_rate = Math.round((winRate - prev.win_rate) * 10000) / 10000;
+  }
+  if (prev.discipline_score !== null && disciplineScoreVal !== null) {
+    momDelta.discipline_score = Math.round((disciplineScoreVal - prev.discipline_score) * 10000) / 10000;
+  }
+
+  // tags_pnl：按标签分组 SUM(pnl)（SQL：SELECT tag, SUM(pnl) FROM 完整交易×标签 GROUP BY tag）
+  const byTag = {};
+  for (const c of periodClosed) {
+    for (const tag of c.tags) {
+      (byTag[tag] = byTag[tag] || { tag, pnl: 0, count: 0 });
+      byTag[tag].pnl += c.pnl; byTag[tag].count++;
+    }
+  }
+  const tagsPnl = Object.values(byTag)
+    .map(t => ({ tag: t.tag, pnl: Math.round(t.pnl * 100) / 100, count: t.count }))
+    .sort((a, b) => a.pnl - b.pnl);
+
+  return {
+    period,
+    total_trades: totalTrades,
+    closed_trades: closedTrades,
+    win_rate: winRate,
+    profit_loss: profitLoss,
+    profit_factor: profitFactor,
+    avg_holding_days: avgHoldingDays,
+    discipline_score: disciplineScoreVal,
+    discipline_violations: disciplineViolations,
+    violations_top3: violationsTop3,
+    mom_delta: momDelta,
+    tags_pnl: tagsPnl,
+  };
+}
+
+// ---------- 2. 持久化：两次写入（架构红线落地） ----------
+// 第一次 INSERT 写全部确定性列 + 全部 LLM 列（空值），第二次 UPDATE 只填 LLM 文本列
+// 这样确保 LLM 返回值永远不进入数值列，并且支持离线重试
+// 注意：review_reports 的 INSERT 全项目仅此一处（合规扫描逻辑在 llm.js）
+function persistReport(metrics, llmText) {
+  const id = uuid();
+  const ts = now();
+  const compBase = JSON.parse(complianceScan(llmText.report_text, llmText.summary_text));
+  // 一并记录本次走的是真实 LLM 还是模板引擎（确定性元数据，不含任何数值指标）
+  compBase.llm_source = llmText.llm_source || 'mock';
+  if (llmText.llm_note) compBase.llm_note = llmText.llm_note;
+  const compliance = JSON.stringify(compBase);
+
+  // —— 第 1 次：只写确定性列 ——
+  run(`INSERT OR REPLACE INTO review_reports
+        (id, user_id, period,
+         total_trades, win_rate, profit_loss, discipline_score,
+         violations_top3, mom_delta_json, metrics_json, compliance_scan,
+         report_text, summary_text, llm_model, llm_prompt_ver, created_at)
+      VALUES
+        ($id, $u, $period,
+         $total, $wr, $pl, $ds,
+         $vt3, $mom, $mj, $comp,
+         NULL, NULL, NULL, NULL, $ts)`, {
+    $id: id, $u: LOCAL_USER_ID, $period: metrics.period,
+    $total: metrics.total_trades,
+    $wr: metrics.win_rate,
+    $pl: metrics.profit_loss,
+    $ds: metrics.discipline_score,
+    $vt3: JSON.stringify(metrics.violations_top3 || []),
+    $mom: JSON.stringify(metrics.mom_delta || {}),
+    $mj: JSON.stringify(metrics),
+    $comp: compliance,
+    $ts: ts,
+  });
+
+  // —— 第 2 次：只 UPDATE LLM 文本列（不再触碰任何数值列） ——
+  run(`UPDATE review_reports
+        SET report_text=$rt, summary_text=$st, llm_model=$m, llm_prompt_ver=$v
+        WHERE user_id=$u AND period=$period`, {
+    $rt: llmText.report_text,
+    $st: llmText.summary_text,
+    $m: llmText.llm_model,
+    $v: llmText.llm_prompt_ver,
+    $u: LOCAL_USER_ID,
+    $period: metrics.period,
+  });
+
+  return id;
+}
+
+// 生成/重新生成体检报告主流程
+async function generateReportFor(period) {
+  // 先确保纪律规则引擎已跑（最新违规数据）
+  runRuleEngine();
+  const metrics = computeMonthlyMetrics(period);
+  // 走真实 LLM（已配置 API 时）；未配置 / 调用失败 / 输出越界 → 自动回退模板引擎
+  const llmText = await callLLMAPI(metrics);
+  persistReport(metrics, llmText);
+  return { metrics, llmText };
+}
+
+// ---------- 3. 渲染 ----------
+function renderReport(el) {
+  // 默认周期：最近完整月
+  const nowDate = new Date();
+  nowDate.setDate(1);
+  nowDate.setMonth(nowDate.getMonth() - 1);
+  const defaultPeriod = `${nowDate.getFullYear()}-${String(nowDate.getMonth() + 1).padStart(2, '0')}`;
+
+  // 报告历史
+  const history = q(
+    `SELECT * FROM review_reports WHERE user_id=$u ORDER BY period DESC`,
+    { $u: LOCAL_USER_ID }
+  );
+
+  // 当前选中的报告
+  const state = {
+    period: defaultPeriod,
+    selectedPeriod: defaultPeriod,
+    collapsed: false,
+    loading: false,
+    llmPanelOpen: false,
+    llmMsg: '',
+    llmMsgCls: '',
+  };
+
+  // 如果已有报告，选中最新的那个
+  if (history.length) state.selectedPeriod = history[0].period;
+
+  renderOnce();
+
+  function renderOnce() {
+    const selected = history.find(h => h.period === state.selectedPeriod);
+    const m = selected ? JSON.parse(selected.metrics_json) : null;
+
+    // Top3 违规名渲染
+    const top3List = m && m.violations_top3 ? m.violations_top3 : [];
+    const top3HTML = top3List.length
+      ? top3List.map(v => `<div class="flex justify-between items-center py-1.5 border-b border-slate-100 last:border-0">
+          <span class="text-sm text-slate-600">${ruleName(v.rule)}</span>
+          <span class="text-xs bg-red-50 text-red-600 rounded px-2 py-0.5 font-medium">${v.count} 次</span>
+        </div>`).join('')
+      : '<div class="text-sm text-slate-400">暂无违规记录</div>';
+
+    // 合规扫描
+    let compHTML = '';
+    let llmMeta = null;
+    if (selected && selected.compliance_scan) {
+      try {
+        const comp = JSON.parse(selected.compliance_scan);
+        llmMeta = comp;
+        if (comp.status === 'pass') {
+          compHTML = `<span class="inline-flex items-center gap-1 text-xs text-emerald-600 bg-emerald-50 rounded px-2 py-0.5">✓ 合规扫描通过</span>`;
+        } else {
+          compHTML = `<span class="inline-flex items-center gap-1 text-xs text-red-600 bg-red-50 rounded px-2 py-0.5">⚠ 禁用词命中：${(comp.hits || []).map(esc).join('、')}</span>`;
+        }
+      } catch (_) {
+        compHTML = `<span class="text-xs text-slate-400">未扫描</span>`;
+      }
+    }
+
+    const historyHTML = history.length
+      ? history.map(h => `
+          <button class="hist-item w-full text-left px-3 py-2 rounded-lg text-sm border ${h.period === state.selectedPeriod ? 'bg-indigo-50 border-indigo-300 text-indigo-700' : 'bg-white border-slate-200 hover:bg-slate-50'}" data-period="${h.period}">
+            <div class="font-medium">${h.period} 月</div>
+            <div class="text-xs text-slate-400 mt-0.5">${new Date(h.created_at * 1000).toLocaleString('zh-CN', { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' })}</div>
+          </button>`).join('')
+      : '<div class="text-slate-300 text-sm text-center py-6">还没有任何体检报告，选一个月份点击生成</div>';
+
+    const noData = !selected;
+
+    // LLM 引擎状态（Key 只在本机 localStorage）
+    const cfg = llmConfig();
+    const llmOn = !!(cfg.baseUrl && cfg.model && cfg.apiKey);
+    const llmLabel = llmOn ? cfg.model : '本地模板（未配置 API）';
+    // 已配置 API 但最近一次生成走了回退：引擎按钮与提示条都要显性化，
+    // 否则用户会误以为报告是真实模型写的（失败原因只在卡片底部小字里，容易漏看）
+    const fellBack = !!(llmOn && llmMeta && llmMeta.llm_source === 'mock' && llmMeta.llm_note);
+    const providerOpts = Object.entries(LLM_PROVIDERS)
+      .map(([k, v]) => `<option value="${k}" ${cfg.provider === k ? 'selected' : ''}>${v.label}</option>`).join('');
+
+    // 数字溯源：文本里对不上指标 JSON 的数字（只提示，不阻断）
+    const unv = (selected && selected.report_text) ? unverifiedNumbers(selected.report_text, m) : [];
+
+    el.innerHTML = `
+    <div class="p-6 space-y-6">
+      <!-- 顶部：月份选择 + 生成按钮 + 历史列表 -->
+      <div class="bg-white rounded-xl border border-slate-200 p-5">
+        <div class="flex flex-wrap items-end gap-3">
+          <label class="text-sm text-slate-600">报告月份
+            <input id="r-period" type="month" value="${state.selectedPeriod || defaultPeriod}" class="mt-1 block border rounded-lg px-2 py-1.5 text-sm">
+          </label>
+          <button id="r-gen" class="px-4 py-1.5 bg-indigo-600 text-white rounded-lg text-sm hover:bg-indigo-700 disabled:opacity-50">
+            ${state.loading ? '生成中…' : noData ? '生成本月体检报告' : '重新生成'}
+          </button>
+          <button id="r-llm" class="px-3 py-1.5 rounded-lg text-sm border ${fellBack ? 'bg-amber-50 border-amber-300 text-amber-700' : llmOn ? 'bg-emerald-50 border-emerald-300 text-emerald-700' : 'bg-white border-slate-300 text-slate-600'} hover:bg-slate-50" title="${fellBack ? esc('上次生成已回退：' + llmMeta.llm_note) : '配置真实 LLM 接口'}">
+            AI 引擎：${esc(llmLabel)}${fellBack ? ' · 已回退' : ''}
+          </button>
+          ${compHTML}
+          <span class="ml-auto text-xs text-slate-400">每字段来自本地确定性计算 · LLM 只写自然语言</span>
+        </div>
+
+        ${fellBack ? `
+        <div class="mt-3 flex flex-wrap items-start gap-2 text-xs bg-amber-50 border border-amber-200 text-amber-800 rounded-lg px-3 py-2">
+          <span class="font-medium whitespace-nowrap">⚠ 真实模型调用失败，已自动回退模板引擎</span>
+          <span class="flex-1 min-w-[12rem] break-all">${esc(llmMeta.llm_note)}</span>
+          <button id="r-llm-alert-open" class="underline whitespace-nowrap">检查设置</button>
+        </div>` : ''}
+
+        <!-- LLM 配置面板（默认收起） -->
+        <div id="r-llm-panel" class="${state.llmPanelOpen ? '' : 'hidden'} mt-4 p-4 bg-slate-50 border border-slate-200 rounded-xl space-y-3">
+          <div class="grid grid-cols-1 md:grid-cols-3 gap-3">
+            <label class="text-xs text-slate-500">服务商
+              <select id="llm-provider" class="mt-1 w-full border rounded-lg px-2 py-1.5 text-sm bg-white">${providerOpts}</select>
+            </label>
+            <label class="text-xs text-slate-500">Base URL（OpenAI 兼容）
+              <input id="llm-base" value="${esc(cfg.baseUrl)}" placeholder="https://api.deepseek.com/v1" class="mt-1 w-full border rounded-lg px-2 py-1.5 text-sm bg-white">
+            </label>
+            <label class="text-xs text-slate-500">模型名
+              <input id="llm-model" value="${esc(cfg.model)}" placeholder="deepseek-flash" class="mt-1 w-full border rounded-lg px-2 py-1.5 text-sm bg-white">
+            </label>
+          </div>
+          <label class="block text-xs text-slate-500">API Key（只存本机 localStorage，不经过我们的服务器）
+            <input id="llm-key" type="password" value="${esc(cfg.apiKey)}" placeholder="sk-..." class="mt-1 w-full border rounded-lg px-2 py-1.5 text-sm bg-white font-mono">
+          </label>
+          <div class="flex flex-wrap items-center gap-2">
+            <button id="llm-save" class="px-3 py-1.5 bg-indigo-600 text-white rounded-lg text-xs hover:bg-indigo-700">保存</button>
+            <button id="llm-test" class="px-3 py-1.5 bg-white border border-slate-300 rounded-lg text-xs hover:bg-slate-100">测试连接</button>
+            <button id="llm-clear" class="px-3 py-1.5 bg-white border border-slate-300 rounded-lg text-xs text-slate-500 hover:bg-slate-100">清除配置</button>
+            <span id="llm-msg" class="text-xs ${state.llmMsgCls || 'text-slate-500'}">${esc(state.llmMsg || '')}</span>
+          </div>
+          <p class="text-xs text-slate-400 leading-relaxed">纯前端直连：请求从你的浏览器直接发往上面这个 Base URL。若浏览器拦截跨域（控制台报 CORS / Failed to fetch），说明该接口不允许网页直连，请填入你自己搭建的跨域代理地址。生成失败会自动回退本地模板引擎，不会丢报告。</p>
+        </div>
+        ${history.length ? `<div class="mt-4 flex gap-2 flex-wrap">${history.map(h => `
+          <button class="hist-chip text-xs px-2.5 py-1 rounded-full border ${h.period === state.selectedPeriod ? 'bg-indigo-600 text-white border-indigo-600' : 'bg-white text-slate-500 border-slate-200 hover:bg-slate-50'}" data-period="${h.period}">${h.period}</button>
+        `).join('')}</div>` : ''}
+      </div>
+
+      ${noData ? `
+      <div class="bg-white rounded-2xl border border-dashed border-slate-300 p-16 text-center">
+        <div class="text-lg font-semibold text-slate-700 mb-2">${state.selectedPeriod} 月还没有体检报告</div>
+        <p class="text-sm text-slate-500 mb-5">AI 月度体检报告需要至少一个月以上的交易数据才能生成。先到「交割单导入」生成或导入 ${state.selectedPeriod} 的成交记录。</p>
+        <a href="#/import" class="inline-block px-5 py-2.5 bg-indigo-600 text-white rounded-lg hover:bg-indigo-700 text-sm">前往交割单导入中心</a>
+      </div>
+      ` : `
+      <div class="grid grid-cols-1 lg:grid-cols-4 gap-4">
+        <!-- 指标概览卡（全来自确定性 metrics_json） -->
+        <div class="lg:col-span-1 space-y-4">
+          <div class="bg-white rounded-xl border border-slate-200 p-5">
+            <h3 class="font-semibold text-sm mb-4">指标概览（${selected.period}）
+              <span class="ml-1 text-[10px] text-slate-400 font-normal">月内口径</span>
+            </h3>
+            <div class="space-y-3">
+              ${[
+                ['净盈亏', m.profit_loss !== null ? (m.profit_loss >= 0 ? '+' : '') + fmtMoney(m.profit_loss) + ' 元' : '—', m.profit_loss >= 0 ? 'text-red-600' : 'text-green-600'],
+                ['胜率', m.win_rate !== null ? fmtPct(m.win_rate) : '—', 'text-slate-800'],
+                ['盈亏比', m.profit_factor !== null ? m.profit_factor.toFixed(2) : '—', 'text-slate-800'],
+                ['纪律执行率', m.discipline_score !== null ? fmtPct(m.discipline_score) : '—', m.discipline_score !== null && m.discipline_score < 0.9 ? 'text-amber-500' : 'text-emerald-600'],
+                ['成交笔数', m.total_trades + ' 笔', 'text-slate-800'],
+                ['平均持仓', m.avg_holding_days !== null ? m.avg_holding_days + ' 天' : '—', 'text-slate-800'],
+              ].map(([k, v, cls]) => `
+                <div class="flex justify-between items-center py-1.5 border-b border-slate-100 last:border-0">
+                  <span class="text-xs text-slate-500">${k}</span>
+                  <span class="text-sm font-medium ${cls}">${v}</span>
+                </div>`).join('')}
+              ${m.mom_delta && Object.keys(m.mom_delta).length ? `<div class="pt-2 border-t border-slate-100 mt-2">
+                <div class="text-xs text-slate-400 mb-1">环比上月</div>
+                ${m.mom_delta.profit_loss !== undefined ? `<div class="text-xs text-slate-500">盈亏 ${fmtDelta(m.mom_delta.profit_loss)}</div>` : ''}
+                ${m.mom_delta.win_rate !== undefined ? `<div class="text-xs text-slate-500">胜率 ${fmtDelta(m.mom_delta.win_rate)}</div>` : ''}
+                ${m.mom_delta.discipline_score !== undefined ? `<div class="text-xs text-slate-500">纪律 ${fmtDelta(m.mom_delta.discipline_score)}</div>` : ''}
+              </div>` : ''}
+            </div>
+          </div>
+
+          <div class="bg-white rounded-xl border border-slate-200 p-5">
+            <h3 class="font-semibold text-sm mb-3">违规 Top3</h3>
+            ${top3HTML}
+          </div>
+        </div>
+
+        <!-- AI 报告正文 + 一句话摘要 -->
+        <div class="lg:col-span-3 bg-white rounded-xl border border-slate-200 p-6">
+          <div class="flex items-center mb-4">
+            <div class="font-semibold text-lg">AI 月度体检报告</div>
+            <span class="ml-3 text-xs bg-indigo-50 text-indigo-600 rounded px-2 py-0.5">${selected.period}</span>
+            <button id="r-toggle" class="ml-auto text-xs text-slate-500 hover:text-slate-700">${state.collapsed ? '展开' : '折叠'}</button>
+          </div>
+
+          <!-- 一句话摘要（LLM summary_text，已转义） -->
+          ${selected.summary_text ? `
+          <div class="bg-indigo-50 border-l-4 border-indigo-500 rounded-r-lg px-4 py-3 mb-5">
+            <div class="text-xs text-indigo-500 font-medium mb-1">一句话摘要</div>
+            <div class="text-sm text-slate-700">${esc(selected.summary_text)}</div>
+          </div>` : ''}
+
+          <!-- 报告正文（LLM report_text，可折叠，已转义） -->
+          ${!state.collapsed && selected.report_text ? `
+          <div class="text-sm text-slate-700 leading-relaxed whitespace-pre-wrap report-body">
+            ${esc(selected.report_text)}
+          </div>` : ''}
+          ${!selected.report_text ? '<div class="text-sm text-slate-400">正文尚未生成</div>' : ''}
+
+          <!-- 合规扫描 + 模型信息 -->
+          <div class="mt-6 pt-4 border-t border-slate-100 flex flex-wrap items-center gap-3 text-xs text-slate-400">
+            ${compHTML}
+            ${llmMeta && llmMeta.llm_source === 'remote' ? '<span class="inline-flex items-center gap-1 text-xs text-emerald-600 bg-emerald-50 rounded px-2 py-0.5">真实 LLM 生成</span>' : ''}
+            ${llmMeta && llmMeta.llm_source === 'mock' ? '<span class="inline-flex items-center gap-1 text-xs text-amber-600 bg-amber-50 rounded px-2 py-0.5">模板引擎生成</span>' : ''}
+            ${unv.length ? `<span class="inline-flex items-center gap-1 text-xs text-amber-600 bg-amber-50 rounded px-2 py-0.5" title="这些数字在指标 JSON 中找不到来源：${unv.join('、')}">⚠ ${unv.length} 个数字未溯源</span>` : ''}
+            <span>模型：${esc(selected.llm_model || '—')}</span>
+            <span>Prompt 版本：${esc(selected.llm_prompt_ver || '—')}</span>
+            <span class="ml-auto">生成于 ${selected.created_at ? new Date(selected.created_at * 1000).toLocaleString('zh-CN') : '—'}</span>
+            ${llmMeta && llmMeta.llm_note ? `<div class="w-full mt-1 text-xs text-amber-600">${esc(llmMeta.llm_note)}</div>` : ''}
+          </div>
+        </div>
+      </div>
+      `}
+
+      <!-- 底部：历史列表（完整） -->
+      ${history.length ? `
+      <div class="bg-white rounded-xl border border-slate-200 p-5">
+        <h3 class="font-semibold text-sm mb-3">报告历史（${history.length} 份）</h3>
+        <div class="grid grid-cols-2 md:grid-cols-4 gap-3">
+          ${historyHTML}
+        </div>
+      </div>
+      ` : ''}
+    </div>`;
+
+    // 事件绑定
+    el.querySelector('#r-period').onchange = e => { state.selectedPeriod = e.target.value; renderOnce(); };
+    el.querySelector('#r-gen').onclick = async () => {
+      const period = el.querySelector('#r-period').value;
+      if (!period) { alert('请选择月份'); return; }
+      state.loading = true; renderOnce();
+      try {
+        await generateReportFor(period);
+        // 刷新 history + 选中当前 period
+        const refreshed = q(
+          `SELECT * FROM review_reports WHERE user_id=$u ORDER BY period DESC`,
+          { $u: LOCAL_USER_ID }
+        );
+        history.splice(0, history.length, ...refreshed);
+        state.selectedPeriod = period;
+      } catch (e) {
+        alert('生成失败：' + e.message);
+        console.error(e);
+      } finally {
+        state.loading = false;
+        renderOnce();
+      }
+    };
+    // —— LLM 引擎配置面板 ——
+    const panel = el.querySelector('#r-llm-panel');
+    el.querySelector('#r-llm').onclick = () => { state.llmPanelOpen = !state.llmPanelOpen; panel.classList.toggle('hidden', !state.llmPanelOpen); };
+    // 回退提示条上的「检查设置」直接展开配置面板
+    const alertOpen = el.querySelector('#r-llm-alert-open');
+    if (alertOpen) alertOpen.onclick = () => { state.llmPanelOpen = true; panel.classList.remove('hidden'); panel.scrollIntoView({ block: 'nearest', behavior: 'smooth' }); };
+    el.querySelector('#llm-provider').onchange = e => {
+      const p = LLM_PROVIDERS[e.target.value];
+      if (!p) return;
+      if (p.baseUrl) el.querySelector('#llm-base').value = p.baseUrl;
+      if (p.model) el.querySelector('#llm-model').value = p.model;
+    };
+    const readCfg = () => ({
+      provider: el.querySelector('#llm-provider').value,
+      baseUrl: el.querySelector('#llm-base').value.trim(),
+      model: el.querySelector('#llm-model').value.trim(),
+      apiKey: el.querySelector('#llm-key').value.trim(),
+    });
+    el.querySelector('#llm-save').onclick = () => {
+      saveLLMConfig(readCfg());
+      state.llmMsg = '已保存到本机浏览器';
+      state.llmMsgCls = 'text-emerald-600';
+      renderOnce();
+    };
+    el.querySelector('#llm-test').onclick = async () => {
+      saveLLMConfig(readCfg());
+      state.llmMsg = '测试中…';
+      state.llmMsgCls = 'text-slate-500';
+      renderOnce();
+      const r = await testLLMConnection();
+      state.llmMsg = r.msg;
+      state.llmMsgCls = r.ok ? 'text-emerald-600' : 'text-red-600';
+      renderOnce();
+    };
+    el.querySelector('#llm-clear').onclick = () => {
+      clearLLMConfig();
+      state.llmMsg = '已清除，回到本地模板引擎';
+      state.llmMsgCls = 'text-slate-500';
+      renderOnce();
+    };
+
+    const toggle = el.querySelector('#r-toggle');
+    if (toggle) toggle.onclick = () => { state.collapsed = !state.collapsed; renderOnce(); };
+    el.querySelectorAll('.hist-item, .hist-chip').forEach(b => {
+      if (b.dataset.period) b.onclick = () => { state.selectedPeriod = b.dataset.period; renderOnce(); };
+    });
+  }
+}
+
+
+// ============================================================
+// ===== 拼接文件 10/10：js/app.js =====
+// ============================================================
+// ============================================================
+// app.js — 路由与导航（首屏=归因看板，归因+纪律权重≥70% 硬约束）
+// ============================================================
+
+// 导航顺序即信息架构：归因/纪律在上部；AI问答类与信号对照不放首屏
+const ROUTES = [
+  { hash: '#/dashboard', name: '归因看板', render: renderDashboard, sub: '确定性计算 · 每个数字可点击溯源' },
+  { hash: '#/discipline', name: '纪律系统', render: renderDiscipline, sub: '违规自动标记 · 执行率量化' },
+  { hash: '#/plans', name: '交易前计划', render: renderPlans, sub: '买入理由/止损/仓位，事后对照' },
+  { hash: '#/report', name: '月度体检', render: renderReport, sub: 'AI 自然语言报告 · 确定性指标 JSON → LLM' },
+  { hash: '#/ledger', name: '复盘账本', render: renderLedger, sub: 'FIFO 配对 · T+1 校验 · 笔记标签' },
+  { hash: '#/import', name: '交割单导入', render: renderImport, sub: '券商模板 · CSV映射 · 模拟数据' },
+  { hash: '#/signal', name: '信号对照', render: renderSignal, sub: '三层对照（信号/成交 · 滑点/延迟）' },
+];
+
+function currentRoute() {
+  const h = location.hash || '#/dashboard';
+  return ROUTES.find(r => r.hash === h) || ROUTES[0];
+}
+
+function render() {
+  const route = currentRoute();
+  document.querySelectorAll('.nav-item').forEach(a => {
+    const active = a.dataset.hash === route.hash;
+    a.className = `nav-item flex items-center px-4 py-2.5 rounded-lg text-sm transition ${active ? 'bg-indigo-600 text-white font-medium' : 'text-slate-600 hover:bg-slate-100'}`;
+  });
+  document.getElementById('view-title').textContent = route.name;
+  document.getElementById('view-sub').textContent = route.sub;
+  route.render(document.getElementById('view'));
+  document.querySelector('main').scrollTop = 0;
+}
+
+async function boot() {
+  const mask = document.getElementById('boot-mask');
+  try {
+    await initDB();
+  } catch (e) {
+    mask.innerHTML = `<div class="text-red-600 text-sm">数据库初始化失败：${e.message}<br>请检查网络（sql.js/Tailwind 走 CDN）后刷新。</div>`;
+    return;
+  }
+  // 导航渲染
+  document.getElementById('nav').innerHTML = ROUTES.map(r =>
+    `<a href="${r.hash}" data-hash="${r.hash}" class="nav-item">${r.name}${r.hash === '#/signal' ? '<span class="ml-auto text-xs opacity-60">P1</span>' : ''}</a>`).join('');
+  const user = q1('SELECT * FROM users WHERE id=$id', { $id: LOCAL_USER_ID });
+  document.getElementById('user-badge').textContent = `${user.nickname} · ${user.plan_tier === 'free' ? '免费档' : user.plan_tier}`;
+  document.getElementById('btn-export').onclick = () => exportSqliteFile();
+  mask.remove();
+  window.addEventListener('hashchange', render);
+  render();
+}
+
+boot();
+
+
+// ============================================================
+// [构建注入] demo.js — 演示模式（非源文件，由 build_demo.py 生成）
+//   1) 禁用 IndexedDB 读写（file:// 下不可靠；每次打开即同一份干净演示数据）
+//   2) boot 完成后自动载入固定种子模拟数据，直接展示归因看板
+//   3) 顶部演示横幅 + 「重置演示数据」「演示导览」
+// ============================================================
+(function demoMode() {
+  // —— 1. 禁用 IndexedDB ——
+  // 本段与 app.js 末尾 boot() 同属一个同步任务：boot 内 initDB 在
+  // `await initSqlJs(...)` 处让出，其恢复（含 idbGet 调用）必晚于本段执行，禁用必然生效。
+  idbGet = async () => null;   // 不读历史 dump，每次打开都是干净库
+  idbSet = async () => {};     // 不写 IndexedDB（scheduleSave 防抖回调落空转）
+
+  // 播种：调用现有模拟数据生成函数（固定种子 mulberry32(20261027)，可复现）
+  function seedDemoData() {
+    const _alert = window.alert;
+    const _renderImport = renderImport;
+    window.alert = () => {};        // 抑制 generateMock 的完成弹窗
+    renderImport = () => {};        // 抑制导入页重渲染（当前停留在看板）
+    try { generateMock(null); } finally {
+      window.alert = _alert;
+      renderImport = _renderImport;
+    }
+  }
+
+  // 自动播种模拟信号（依赖 generateMock 的 trades 已存在）
+  function autoSeedSignals() {
+    const _alert = window.alert;
+    window.alert = () => {};
+    try { generateMockSignals(); } finally { window.alert = _alert; }
+  }
+
+  // 自动为最近完整月和再前一个月生成体检报告（让首次打开就有报告可看）
+  async function autoSeedReports() {
+    // 最近完整月
+    const d = new Date(); d.setDate(1); d.setMonth(d.getMonth() - 1);
+    const period1 = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}`;
+    d.setMonth(d.getMonth() - 1);
+    const period2 = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}`;
+    for (const p of [period1, period2]) {
+      try {
+        // 已有报告则跳过（幂等）
+        const exists = q1('SELECT id FROM review_reports WHERE user_id=$u AND period=$p',
+                          { $u: LOCAL_USER_ID, $p: p });
+        if (!exists) {
+          await generateReportFor(p);
+          console.log('[demo] 体检报告已自动生成：' + p);
+        }
+      } catch (e) { console.warn('[demo] 体检报告自动生成失败：' + p, e); }
+    }
+  }
+
+  // 重置：清空业务表 → 重新播种 → 重新生成体检报告 → 回到归因看板
+  async function resetDemoData() {
+    ['trades', 'rule_violations', 'import_batches', 'trade_plans',
+     'metric_snapshots', 'signals', 'signal_fills', 'review_reports']
+      .forEach(t => run('DELETE FROM ' + t));
+    heatMonth = null;               // 日历热力图回到最新月份
+    seedDemoData();
+    autoSeedSignals();              // 信号模块：同步重置
+    await autoSeedReports();
+    location.hash = '#/dashboard';
+    render();
+  }
+
+  // 演示导览模态框（复用 ui.js openModal 骨架）
+  function showGuide() {
+    openModal({
+      title: '演示导览',
+      width: 'max-w-lg',
+      bodyHTML: `
+        <p class="text-sm text-slate-600 leading-relaxed">面向 A 股散户的「交易复盘 + 纪律」工具：交割单导入 → FIFO 复盘账本 → 确定性归因看板 → 纪律执行率量化，做全行业空白的「AI 行为级复盘」。</p>
+        <ol class="space-y-2.5 text-sm text-slate-600 mt-4">
+          <li class="flex gap-2.5"><span class="shrink-0 w-5 h-5 rounded-full bg-indigo-600 text-white text-xs flex items-center justify-center mt-0.5">1</span>
+            <span><span class="font-medium">归因看板</span>（当前页）：每个数字可点击溯源到底层成交记录——点任意 KPI 卡片、热力图格子、个股/标签行试试。</span></li>
+          <li class="flex gap-2.5"><span class="shrink-0 w-5 h-5 rounded-full bg-indigo-600 text-white text-xs flex items-center justify-center mt-0.5">2</span>
+            <span><span class="font-medium">纪律系统</span>：执行率 70.8%，含违规明细（判定依据快照可回放）与 5 条 A 股特色规则（尾盘追高 / T+1 / 止损 / 仓位 / 周频率）。</span></li>
+          <li class="flex gap-2.5"><span class="shrink-0 w-5 h-5 rounded-full bg-indigo-600 text-white text-xs flex items-center justify-center mt-0.5">3</span>
+            <span><span class="font-medium">复盘账本</span>：FIFO 配对生成「完整交易」，T+1 当日买入自动锁定，支持笔记与标签。</span></li>
+          <li class="flex gap-2.5"><span class="shrink-0 w-5 h-5 rounded-full bg-indigo-600 text-white text-xs flex items-center justify-center mt-0.5">4</span>
+            <span><span class="font-medium">交割单导入</span>：券商模板按表头指纹自动命中（华泰/东财内置），未命中走通用 CSV 映射工具。</span></li>
+        </ol>
+        <p class="text-xs text-slate-400 border-t border-slate-100 pt-3 mt-4 leading-relaxed">技术说明：SQLite（sql.js WASM）纯前端本地运行，演示数据为固定种子确定性生成，数据不出本地。演示版不读写 IndexedDB，每次打开即同一份干净数据。</p>`,
+    });
+  }
+
+  // —— 3. 顶部演示横幅（立即挂载，不依赖数据库） ——
+  function mountBanner() {
+    const app = document.getElementById('app');
+    const banner = document.createElement('div');
+    banner.id = 'demo-banner';
+    banner.className = 'h-10 shrink-0 bg-indigo-700 text-white flex items-center px-4 gap-3 text-xs select-none';
+    banner.innerHTML = `
+      <span class="font-semibold bg-white/20 rounded px-1.5 py-0.5">演示版</span>
+      <span class="text-indigo-100 truncate">全部为本地模拟数据 · 不荐股 / 不承诺收益 / 不自动交易</span>
+      <span class="ml-auto flex gap-2 shrink-0">
+        <button id="demo-guide-btn" class="px-2.5 py-1 rounded bg-white/15 hover:bg-white/30 transition">演示导览</button>
+        <button id="demo-reset-btn" class="px-2.5 py-1 rounded bg-white/15 hover:bg-white/30 transition">重置演示数据</button>
+      </span>`;
+    document.body.insertBefore(banner, app);
+    app.style.height = 'calc(100vh - 2.5rem)';   // 为横幅让出 40px，保持原有 flex 布局
+    banner.querySelector('#demo-guide-btn').onclick = showGuide;
+    banner.querySelector('#demo-reset-btn').onclick = resetDemoData;
+  }
+  mountBanner();
+
+  // —— 2. 等待 app boot 完成（boot-mask 被移除）后播种并刷新看板 ——
+  const timer = setInterval(() => {
+    if (document.getElementById('boot-mask')) return;
+    clearInterval(timer);
+    (async () => {
+      try {
+        seedDemoData();
+        autoSeedSignals();            // 信号模块：播种模拟信号 + autoMatch 匹配
+        await autoSeedReports();     // 演示版首次打开即有体检报告
+        render();                     // 用模拟数据重渲染归因看板（默认首屏）
+        console.log('[demo] 演示数据 + 模拟信号 + 体检报告已载入（固定种子，IndexedDB 已禁用）');
+      } catch (e) {
+        console.error('[demo] 演示数据加载失败', e);
+      }
+    })();
+  }, 40);
+  setTimeout(() => clearInterval(timer), 20000);   // 兜底防泄漏
+})();
+
+</script>
+</body>
+</html>
