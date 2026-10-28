@@ -2197,6 +2197,93 @@ function computeAttribution() {
   };
 }
 
+// ---------- 信号准确率统计（结果层：跟单之后赚不赚钱） ----------
+// 口径（确定性计算 v1，全部可溯源）：
+//   1. 仅「买入信号」做盈亏归因——卖出信号在多腿 FIFO 下无法干净归属，只统计执行/漏跟；
+//   2. 归因规则：闭环配对的「首笔开仓成交」（buyTradeIds[0]）若被某信号匹配
+//      （signal_fills.trade_id），该配对盈亏计给该信号；
+//      一笔开仓被多条信号命中时只计给信号时间最早的一条，避免重复计数；
+//   3. 未闭环（仍持仓中）的已执行信号不计入胜率，只计入「已执行」；
+//   4. 胜率 = 归属配对合计盈亏 > 0 的信号数 / 有归属配对的信号数。
+// 合规：本统计是对历史跟单结果的事后核对，不构成对任何信号来源的推荐或评价。
+const PLATFORM_LABEL = { joinquant: '聚宽', qmt: 'QMT', csv: 'CSV 导入', mock: '模拟', other: '其他' };
+
+function computeSignalAccuracy() {
+  const signals = q('SELECT * FROM signals WHERE user_id=$u ORDER BY signaled_at', { $u: LOCAL_USER_ID });
+  if (!signals.length) return null;
+  const fills = q('SELECT * FROM signal_fills WHERE user_id=$u AND signal_id IS NOT NULL AND trade_id IS NOT NULL', { $u: LOCAL_USER_ID });
+  const trades = q('SELECT * FROM trades WHERE user_id=$u ORDER BY traded_at', { $u: LOCAL_USER_ID });
+
+  const sigById = Object.fromEntries(signals.map(s => [s.id, s]));
+  const groups = {};
+  const g = p => (groups[p] = groups[p] || {
+    platform: p, total: 0, buyTotal: 0, executed: 0,
+    closed: 0, wins: 0, pnl: 0, slipSum: 0, slipN: 0,
+  });
+  signals.forEach(s => {
+    const grp = g(s.platform || 'other');
+    grp.total++;
+    if (s.direction === 'buy') grp.buyTotal++;
+  });
+
+  // trade_id → 信号 id（同笔成交被多信号命中时，最早信号优先）
+  const tradeToSig = {};
+  fills.slice()
+    .sort((a, b) => (sigById[a.signal_id]?.signaled_at || 0) - (sigById[b.signal_id]?.signaled_at || 0))
+    .forEach(f => { if (!tradeToSig[f.trade_id]) tradeToSig[f.trade_id] = f.signal_id; });
+
+  // 已执行信号（filled/partial，按 signal 去重）
+  new Set(fills.map(f => f.signal_id)).forEach(sid => {
+    const s = sigById[sid];
+    if (s) g(s.platform || 'other').executed++;
+  });
+
+  // 每个信号一条代表 fill（滑点在同一信号的各 fill 上数值相同，取一条即可）
+  const lastFill = {};
+  fills.forEach(f => { lastFill[f.signal_id] = f; });
+  Object.values(lastFill).forEach(f => {
+    if (f.slippage === null || f.slippage === undefined) return;
+    const s = sigById[f.signal_id];
+    if (!s) return;
+    const grp = g(s.platform || 'other');
+    grp.slipSum += f.slippage; grp.slipN++;
+  });
+
+  // 闭环配对归因：首笔开仓成交 → 最早命中信号（仅买入信号）
+  const pairs = computePairs(trades);
+  for (const c of pairs.closed) {
+    const openTradeId = c.buyTradeIds[0];
+    const sid = tradeToSig[openTradeId];
+    if (!sid) continue;
+    const s = sigById[sid];
+    if (!s || s.direction !== 'buy') continue;
+    const grp = g(s.platform || 'other');
+    grp.closed++;
+    grp.pnl += c.pnl;
+    if (c.pnl > 0) grp.wins++;
+  }
+
+  const rows = Object.values(groups)
+    .map(x => ({
+      ...x,
+      pnl: Math.round(x.pnl * 100) / 100,
+      winRate: x.closed ? x.wins / x.closed : null,
+      avgSlip: x.slipN ? Math.round((x.slipSum / x.slipN) * 10000) / 10000 : null,
+    }))
+    .sort((a, b) => b.total - a.total);
+
+  const overall = rows.length ? {
+    total: rows.reduce((s, x) => s + x.total, 0),
+    executed: rows.reduce((s, x) => s + x.executed, 0),
+    closed: rows.reduce((s, x) => s + x.closed, 0),
+    wins: rows.reduce((s, x) => s + x.wins, 0),
+    pnl: Math.round(rows.reduce((s, x) => s + x.pnl, 0) * 100) / 100,
+  } : null;
+  if (overall) overall.winRate = overall.closed ? overall.wins / overall.closed : null;
+
+  return { rows, overall };
+}
+
 // ---------- 模拟信号（固定种子，演示用；mulberry32 见 db.js） ----------
 const MOCK_STOCKS = [
   ['600519', '贵州茅台', 1480, 1720], ['000001', '平安银行', 11.2, 13.1],
@@ -2338,6 +2425,7 @@ async function handleSignalFile(file) {
 function renderSignal(el) {
   const signals = q('SELECT * FROM signals WHERE user_id=$u ORDER BY signaled_at DESC', { $u: LOCAL_USER_ID });
   const attr = computeAttribution();
+  const acc = computeSignalAccuracy();
 
   if (!signals.length) {
     el.innerHTML = `
@@ -2420,6 +2508,34 @@ function renderSignal(el) {
           <div class="text-xs text-slate-400 mt-1">${sub}</div>
         </button>`).join('')}
     </div>
+
+    <!-- 信号准确率统计（跟单盈亏，结果层） -->
+    ${acc && acc.overall ? `
+    <div class="bg-white rounded-xl border border-slate-200 p-5">
+      <div class="flex flex-wrap items-center gap-3 mb-1">
+        <h3 class="font-semibold text-sm">信号准确率统计（跟单盈亏）</h3>
+        <span class="text-xs px-2 py-0.5 rounded bg-indigo-50 text-indigo-600">整体胜率 ${acc.overall.winRate !== null ? fmtPct(acc.overall.winRate) : '—'}</span>
+        <span class="text-xs px-2 py-0.5 rounded ${acc.overall.pnl >= 0 ? 'bg-red-50 text-red-600' : 'bg-green-50 text-green-600'}">跟单盈亏 ${acc.overall.pnl >= 0 ? '+' : ''}${fmtMoney(acc.overall.pnl)}</span>
+      </div>
+      <p class="text-xs text-slate-400 mb-3 leading-relaxed">
+        口径：闭环配对的「首笔开仓成交」被信号匹配即归属（多信号命中同一笔只计最早一条）；仅买入信号参与盈亏归因，卖出信号只统计执行/漏跟；未闭环持仓不计入胜率。
+        本统计是对历史跟单结果的事后核对，<span class="text-slate-500">历史表现不代表未来，不构成对任何信号来源的推荐或评价</span>。
+      </p>
+      <div class="overflow-x-auto"><table class="min-w-full text-sm">
+        <thead class="bg-slate-50 text-slate-500 text-xs"><tr>
+          ${['信号来源', '信号数', '买入信号', '已执行', '已闭环', '跟单胜率', '跟单盈亏', '平均滑点'].map(h => `<th class="px-4 py-2 text-left font-medium">${h}</th>`).join('')}
+        </tr></thead>
+        <tbody>${acc.rows.map(r => `<tr class="border-t border-slate-100">
+          <td class="px-4 py-2">${PLATFORM_LABEL[r.platform] || esc(r.platform)}</td>
+          <td class="px-4 py-2 text-right">${r.total}</td>
+          <td class="px-4 py-2 text-right">${r.buyTotal}</td>
+          <td class="px-4 py-2 text-right">${r.executed}</td>
+          <td class="px-4 py-2 text-right">${r.closed}</td>
+          <td class="px-4 py-2 text-right font-medium ${r.winRate === null ? 'text-slate-400' : r.winRate >= 0.5 ? 'text-red-600' : 'text-green-600'}">${r.winRate !== null ? fmtPct(r.winRate) : '—'}</td>
+          <td class="px-4 py-2 text-right font-medium ${r.closed === 0 ? 'text-slate-400' : r.pnl >= 0 ? 'text-red-600' : 'text-green-600'}">${r.closed ? (r.pnl >= 0 ? '+' : '') + fmtMoney(r.pnl) : '—'}</td>
+          <td class="px-4 py-2 text-right ${r.avgSlip === null ? 'text-slate-400' : r.avgSlip > 0 ? 'text-red-600' : r.avgSlip < 0 ? 'text-green-600' : 'text-slate-600'}">${r.avgSlip !== null ? fmtMoney(r.avgSlip) : '—'}</td>
+        </tr>`).join('')}</tbody></table></div>
+    </div>` : ''}
 
     <div class="grid grid-cols-1 lg:grid-cols-2 gap-4">
       <!-- 滑点分布 -->
