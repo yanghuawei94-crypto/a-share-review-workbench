@@ -31,6 +31,71 @@ td { font-variant-numeric: tabular-nums; }
 .kpi-card { cursor: pointer; }
 .kpi-card:hover { transform: translateY(-1px); }
 
+/* ================= 打印（月度体检报告导出 PDF） ================= */
+/* 平时隐藏，仅打印时可见；内容由 report.js fillPrintRoot 同步 */
+#print-root { display: none; }
+
+@page { size: A4; margin: 16mm 14mm; }
+
+@media print {
+  /* 只留打印模板：隐藏应用骨架与演示横幅 */
+  #app, #demo-banner, #boot-mask, #modal-root { display: none !important; }
+  html, body { background: #fff !important; height: auto !important; overflow: visible !important; }
+
+  #print-root {
+    display: block !important;
+    color: #1e293b;
+    font-size: 12px;
+    line-height: 1.75;
+    -webkit-print-color-adjust: exact;
+    print-color-adjust: exact;
+  }
+  .pr-page { max-width: 180mm; margin: 0 auto; }
+
+  .pr-head {
+    display: flex; justify-content: space-between; align-items: flex-end;
+    border-bottom: 2px solid #4f46e5; padding-bottom: 8px; margin-bottom: 14px;
+  }
+  .pr-title { font-size: 20px; font-weight: 700; color: #0f172a; }
+  .pr-sub { font-size: 10px; color: #64748b; margin-top: 2px; }
+  .pr-period {
+    font-size: 14px; font-weight: 600; color: #4f46e5;
+    background: #eef2ff; border-radius: 6px; padding: 3px 10px;
+  }
+
+  .pr-summary {
+    background: #eef2ff; border-left: 4px solid #4f46e5; border-radius: 0 8px 8px 0;
+    padding: 8px 12px; margin-bottom: 14px; font-size: 12.5px;
+  }
+  .pr-summary-label {
+    display: block; font-size: 10px; font-weight: 600; color: #4f46e5; margin-bottom: 2px;
+  }
+
+  .pr-sec { margin-bottom: 14px; page-break-inside: avoid; }
+  .pr-sec-title {
+    font-size: 13px; font-weight: 700; color: #0f172a;
+    border-left: 3px solid #4f46e5; padding-left: 8px; margin-bottom: 6px;
+  }
+  .pr-table { width: 100%; border-collapse: collapse; font-size: 12px; }
+  .pr-table th, .pr-table td {
+    border: 1px solid #e2e8f0; padding: 5px 10px; text-align: left;
+  }
+  .pr-table th { background: #f8fafc; color: #64748b; font-weight: 500; width: 14%; }
+  .pr-table td { color: #0f172a; font-weight: 500; width: 36%; }
+  .pr-mom { font-size: 11px; color: #64748b; margin-top: 4px; }
+
+  .pr-body { white-space: pre-wrap; font-size: 12.5px; }
+
+  .pr-meta {
+    margin-top: 16px; padding-top: 8px; border-top: 1px solid #e2e8f0;
+    font-size: 10px; color: #64748b;
+  }
+  .pr-disclaimer {
+    margin-top: 8px; padding: 8px 10px; background: #f8fafc; border: 1px solid #e2e8f0;
+    border-radius: 6px; font-size: 10px; color: #64748b; line-height: 1.6;
+  }
+}
+
   </style>
 </head>
 <body class="bg-slate-100 text-slate-800">
@@ -3040,7 +3105,95 @@ async function generateReportFor(period) {
   return { metrics, llmText };
 }
 
-// ---------- 3. 渲染 ----------
+// ---------- 3. 打印模板（导出 PDF） ----------
+// 走浏览器 window.print() 管线，不引入 html2canvas/jsPDF：
+// 零新增依赖、中文可选中、离线单文件版保持自包含。
+// #print-root 平时 display:none，仅在 @media print 下可见（样式在 css/app.css）。
+// 内容与屏幕渲染解耦：A4 排版、始终输出完整正文（不受页面折叠状态影响）、
+// 强制携带合规标识与免责声明（产品红线在纸质/转发场景同样生效）。
+function fillPrintRoot(selected, m, llmMeta, unv, top3List) {
+  let root = document.getElementById('print-root');
+  if (!root) {
+    root = document.createElement('div');
+    root.id = 'print-root';
+    document.body.appendChild(root);
+  }
+  if (!selected || !m) { root.innerHTML = ''; return; }
+
+  const kpis = [
+    ['净盈亏', m.profit_loss !== null && m.profit_loss !== undefined ? (m.profit_loss >= 0 ? '+' : '') + fmtMoney(m.profit_loss) + ' 元' : '—'],
+    ['胜率', m.win_rate !== null ? fmtPct(m.win_rate) : '—'],
+    ['盈亏比', m.profit_factor !== null ? m.profit_factor.toFixed(2) : '—'],
+    ['纪律执行率', m.discipline_score !== null ? fmtPct(m.discipline_score) : '—'],
+    ['成交笔数', (m.total_trades ?? 0) + ' 笔'],
+    ['平均持仓', m.avg_holding_days !== null ? m.avg_holding_days + ' 天' : '—'],
+  ];
+  const mom = m.mom_delta && Object.keys(m.mom_delta).length
+    ? [m.mom_delta.profit_loss !== undefined ? '盈亏 ' + fmtDelta(m.mom_delta.profit_loss) : '',
+       m.mom_delta.win_rate !== undefined ? '胜率 ' + fmtDelta(m.mom_delta.win_rate) : '',
+       m.mom_delta.discipline_score !== undefined ? '纪律 ' + fmtDelta(m.mom_delta.discipline_score) : '']
+      .filter(Boolean).join('　')
+    : '';
+  const engine = llmMeta && llmMeta.llm_source === 'remote' ? '真实 LLM 生成' : '模板引擎生成';
+
+  root.innerHTML = `
+  <div class="pr-page">
+    <div class="pr-head">
+      <div>
+        <div class="pr-title">AI 月度体检报告</div>
+        <div class="pr-sub">复盘工作台 · A股复盘 / 纪律 / 归因</div>
+      </div>
+      <div class="pr-period">${esc(selected.period)}</div>
+    </div>
+
+    ${selected.summary_text ? `
+    <div class="pr-summary">
+      <span class="pr-summary-label">一句话摘要</span>
+      ${esc(selected.summary_text)}
+    </div>` : ''}
+
+    <div class="pr-sec">
+      <div class="pr-sec-title">指标概览（${esc(selected.period)} · 月内口径）</div>
+      <table class="pr-table">
+        <tbody>
+          ${[0, 2, 4].map(i => `<tr>
+            <th>${kpis[i][0]}</th><td>${kpis[i][1]}</td>
+            <th>${kpis[i + 1][0]}</th><td>${kpis[i + 1][1]}</td>
+          </tr>`).join('')}
+        </tbody>
+      </table>
+      ${mom ? `<div class="pr-mom">环比上月：${mom}</div>` : ''}
+    </div>
+
+    ${top3List && top3List.length ? `
+    <div class="pr-sec">
+      <div class="pr-sec-title">违规 Top${top3List.length}</div>
+      <table class="pr-table"><tbody>
+        ${top3List.map(v => `<tr><th>${esc(ruleName(v.rule))}</th><td>${v.count} 次</td></tr>`).join('')}
+      </tbody></table>
+    </div>` : ''}
+
+    ${selected.report_text ? `
+    <div class="pr-sec">
+      <div class="pr-sec-title">报告正文</div>
+      <div class="pr-body">${esc(selected.report_text)}</div>
+    </div>` : ''}
+
+    <div class="pr-meta">
+      ${engine} · 模型：${esc(selected.llm_model || '—')} · Prompt 版本：${esc(selected.llm_prompt_ver || '—')}
+      · 生成于 ${selected.created_at ? new Date(selected.created_at * 1000).toLocaleString('zh-CN') : '—'}
+      ${unv && unv.length ? `<br>⚠ ${unv.length} 个数字未溯源（在指标 JSON 中找不到来源：${unv.join('、')}）` : ''}
+    </div>
+
+    <div class="pr-disclaimer">
+      本报告由本地确定性指标计算 + AI 自然语言生成，仅供个人复盘使用，不构成任何投资建议；
+      不推荐个股、不承诺收益。所有数据仅存储于本地浏览器，未上传任何服务器。
+      投资有风险，入市需谨慎。
+    </div>
+  </div>`;
+}
+
+// ---------- 4. 渲染 ----------
 function renderReport(el) {
   // 默认周期：最近完整月
   const nowDate = new Date();
@@ -3137,6 +3290,7 @@ function renderReport(el) {
           <button id="r-llm" class="px-3 py-1.5 rounded-lg text-sm border ${fellBack ? 'bg-amber-50 border-amber-300 text-amber-700' : llmOn ? 'bg-emerald-50 border-emerald-300 text-emerald-700' : 'bg-white border-slate-300 text-slate-600'} hover:bg-slate-50" title="${fellBack ? esc('上次生成已回退：' + llmMeta.llm_note) : '配置真实 LLM 接口'}">
             AI 引擎：${esc(llmLabel)}${fellBack ? ' · 已回退' : ''}
           </button>
+          ${!noData ? `<button id="r-pdf" class="px-3 py-1.5 rounded-lg text-sm border bg-white border-slate-300 text-slate-600 hover:bg-slate-50" title="通过浏览器打印管线导出 A4 PDF（含指标、正文与免责声明）">导出 PDF</button>` : ''}
           ${compHTML}
           <span class="ml-auto text-xs text-slate-400">每字段来自本地确定性计算 · LLM 只写自然语言</span>
         </div>
@@ -3268,6 +3422,11 @@ function renderReport(el) {
     </div>`;
 
     // 事件绑定
+    // 同步打印模板：无论屏幕端是否折叠，打印版始终携带完整正文与合规信息；
+    // 无报告（noData）时自动清空，避免打印出过期内容
+    fillPrintRoot(noData ? null : selected, m, llmMeta, unv, top3List);
+    const pdfBtn = el.querySelector('#r-pdf');
+    if (pdfBtn) pdfBtn.onclick = () => window.print();
     el.querySelector('#r-period').onchange = e => { state.selectedPeriod = e.target.value; renderOnce(); };
     el.querySelector('#r-gen').onclick = async () => {
       const period = el.querySelector('#r-period').value;
