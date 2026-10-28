@@ -368,6 +368,20 @@ function run(sql, params = {}) {        // 写操作 + 自动持久化
   scheduleSave();
 }
 
+// ---------- 删除墓碑（Phase 1 同步补全） ----------
+// 本地删除「已同步行」时必须登记墓碑，否则服务端与其他设备上的旧行删不掉，
+// 下次拉取会被「复活」。重建类流程（规则引擎 / autoMatch）只登记
+// 「旧 ID − 新 ID」差集——确定性 ID 下存活行 ID 不变，不算删除。
+function recordDeletes(table, ids) {
+  if (!ids || !ids.length) return;
+  const ts = now();
+  for (const id of ids) {
+    run('INSERT OR REPLACE INTO sync_tombstones (id, table_name, user_id, deleted_at) VALUES ($id, $t, $u, $ts)',
+      { $id: id, $t: table, $u: LOCAL_USER_ID, $ts: ts });
+  }
+}
+function recordDelete(table, id) { recordDeletes(table, [id]); }
+
 // ---------- DDL：逐字段拷贝自产品文档 §5（11 张表） ----------
 const DDL = `
 -- ========== 用户与订阅（本地最小集合） ==========
@@ -464,7 +478,8 @@ CREATE TABLE IF NOT EXISTS discipline_rules (
     params_json     TEXT NOT NULL,              -- 规则参数（人工设定，模板预填）
     is_builtin_tpl  INTEGER NOT NULL DEFAULT 0,
     enabled         INTEGER NOT NULL DEFAULT 1,
-    created_at      INTEGER NOT NULL
+    created_at      INTEGER NOT NULL,
+    updated_at      INTEGER                   -- 同步水位（规则启停/参数修改也要传播）
 );
 CREATE INDEX IF NOT EXISTS idx_rules_user ON discipline_rules(user_id, enabled);
 
@@ -544,6 +559,16 @@ CREATE TABLE IF NOT EXISTS signal_fills (
     created_at          INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_fills_user ON signal_fills(user_id, match_status);
+
+-- 删除墓碑（Phase 1 同步补全）：本地删除已同步行时登记，
+-- push 时上报服务端并向其他设备传播；否则已删数据会被下次拉取「复活」
+CREATE TABLE IF NOT EXISTS sync_tombstones (
+    id           TEXT NOT NULL,           -- 被删除行的原 ID
+    table_name   TEXT NOT NULL,
+    user_id      TEXT NOT NULL,
+    deleted_at   INTEGER NOT NULL,
+    PRIMARY KEY (table_name, id)
+);
 `;
 
 const LOCAL_USER_ID = 'local-user';
@@ -599,7 +624,7 @@ async function initDB() {
 // 轻量迁移：为存量库补 updated_at（Phase 1 同步水位）。新列允许 NULL，
 // 回填为 created_at，使「从未编辑过」的旧行也参与首次全量同步。
 function migrate() {
-  for (const t of ['trades', 'trade_plans', 'review_reports']) {
+  for (const t of ['trades', 'trade_plans', 'review_reports', 'discipline_rules']) {
     try { db.run(`ALTER TABLE ${t} ADD COLUMN updated_at INTEGER`); } catch (e) { /* 列已存在 */ }
     run(`UPDATE ${t} SET updated_at=created_at WHERE updated_at IS NULL`);
   }
@@ -611,6 +636,9 @@ function migrate() {
     const rows = q('SELECT id FROM discipline_rules WHERE user_id=$u AND rule_key=$k ORDER BY created_at, id', { $u: LOCAL_USER_ID, $k: r.rule_key });
     if (!rows.length) continue;
     for (const dup of rows.slice(1)) {
+      // 登记墓碑：去重删除的规则及其违规也要从云端/其他设备消失
+      recordDeletes('rule_violations', q('SELECT id FROM rule_violations WHERE rule_id=$id', { $id: dup.id }).map(r => r.id));
+      recordDeletes('discipline_rules', [dup.id]);
       run('DELETE FROM rule_violations WHERE rule_id=$id', { $id: dup.id });
       run('DELETE FROM discipline_rules WHERE id=$id', { $id: dup.id });
     }
@@ -989,16 +1017,21 @@ function openNoteEditor(tradeId, onSaved) {
 function runRuleEngine() {
   const rules = q('SELECT * FROM discipline_rules WHERE user_id=$u AND enabled=1', { $u: LOCAL_USER_ID });
   const trades = q('SELECT * FROM trades WHERE user_id=$u ORDER BY traded_at, source_row_no', { $u: LOCAL_USER_ID });
+  // 墓碑差集：重建前的旧违规 ID 快照；重建后仍存在的（确定性 ID）不算删除
+  const oldIds = q('SELECT id FROM rule_violations WHERE user_id=$u', { $u: LOCAL_USER_ID }).map(r => r.id);
   run('DELETE FROM rule_violations WHERE user_id=$u', { $u: LOCAL_USER_ID });
-  if (!trades.length) return;
+  if (!trades.length) { recordDeletes('rule_violations', oldIds); return; }
 
   const pairs = computePairs(trades);
+  const newIds = new Set();
   // 违规 ID 确定性（'rv-'+rule_id+'-'+trade_id）：引擎全量重跑 DELETE+INSERT 后 ID 不变，
   // 多设备同步 upsert 幂等收敛；若用随机 UUID，每次重跑都会在云端叠加一套新违规。
   const add = (rule, trade, evidence, violatedAt) => {
+    const vid = 'rv-' + rule.id + '-' + trade.id;
+    newIds.add(vid);
     run(`INSERT INTO rule_violations (id, user_id, rule_id, trade_id, rule_snapshot, evidence_json, violated_at, created_at)
          VALUES ($id, $u, $rid, $tid, $snap, $ev, $va, $ts)`, {
-      $id: 'rv-' + rule.id + '-' + trade.id, $u: LOCAL_USER_ID, $rid: rule.id, $tid: trade.id,
+      $id: vid, $u: LOCAL_USER_ID, $rid: rule.id, $tid: trade.id,
       $snap: rule.params_json, $ev: JSON.stringify(evidence), $va: violatedAt, $ts: now(),
     });
   };
@@ -1060,6 +1093,8 @@ function runRuleEngine() {
       }
     }
   }
+  // 消失的违规（旧 ID 不在新集合中）登记墓碑，随同步传播删除
+  recordDeletes('rule_violations', oldIds.filter(id => !newIds.has(id)));
 }
 
 // 纪律执行率 = 1 - 违规笔数/总交易笔数（违规笔数按去重交易计）
@@ -1191,7 +1226,7 @@ function renderDiscipline(el) {
     </div>`;
 
     body.querySelectorAll('.rule-toggle').forEach(cb => cb.onchange = () => {
-      run('UPDATE discipline_rules SET enabled=$e WHERE id=$id', { $e: cb.checked ? 1 : 0, $id: cb.dataset.id });
+      run('UPDATE discipline_rules SET enabled=$e, updated_at=$ts WHERE id=$id', { $e: cb.checked ? 1 : 0, $id: cb.dataset.id, $ts: now() });
       runRuleEngine(); renderDiscipline(el);
     });
     body.querySelectorAll('.param-in').forEach(inp => inp.onchange = () => {
@@ -1200,7 +1235,7 @@ function renderDiscipline(el) {
       const v = inp.dataset.key === 'after' ? inp.value : parseFloat(inp.value);
       if (inp.dataset.key !== 'after' && !(v >= 0)) return;
       p[inp.dataset.key] = v;
-      run('UPDATE discipline_rules SET params_json=$p WHERE id=$id', { $p: JSON.stringify(p), $id: inp.dataset.id });
+      run('UPDATE discipline_rules SET params_json=$p, updated_at=$ts WHERE id=$id', { $p: JSON.stringify(p), $id: inp.dataset.id, $ts: now() });
       runRuleEngine(); renderDiscipline(el);
     });
   }
@@ -2124,13 +2159,18 @@ function parseSignalsCSV(text, platformHint = 'other') {
 // 一条信号可能对应多笔成交（分批）→ filled / partial
 function autoMatch() {
   const ts = now();
+  // 墓碑差集快照：重建后仍存在的 fill（确定性 ID）不算删除
+  const oldFillIds = q('SELECT id FROM signal_fills').map(r => r.id);
   // 清空旧 fill（重新跑）
   run('DELETE FROM signal_fills');
 
   const signals = q('SELECT * FROM signals WHERE user_id=$u ORDER BY signaled_at', { $u: LOCAL_USER_ID });
   const allTrades = q('SELECT * FROM trades WHERE user_id=$u ORDER BY traded_at', { $u: LOCAL_USER_ID });
 
-  if (!signals.length || !allTrades.length) return { signals, fills: [] };
+  if (!signals.length || !allTrades.length) {
+    recordDeletes('signal_fills', oldFillIds);
+    return { signals, fills: [] };
+  }
 
   const fills = [];
   // 信号 vs 成交匹配
@@ -2203,6 +2243,10 @@ function autoMatch() {
       $dev: f.deviation_amount, $v: f.match_rule_version, $ts: f.created_at,
     });
   });
+
+  // 消失的 fill（旧 ID 不在新集合中）登记墓碑，随同步传播删除
+  const newFillIds = new Set(fills.map(f => f.id));
+  recordDeletes('signal_fills', oldFillIds.filter(id => !newFillIds.has(id)));
 
   return { signals, fills };
 }
@@ -2442,7 +2486,10 @@ function generateMockSignals() {
     });
   }
 
-  // 落库（去重：同一 symbol+time+direction）
+  // 落库（去重：同一 symbol+time+direction）。先给旧数据登记墓碑——
+  // 新信号用全新 UUID，旧信号及挂在旧信号上的 fill 都要从云端/他端删除
+  recordDeletes('signals', q('SELECT id FROM signals').map(r => r.id));
+  recordDeletes('signal_fills', q('SELECT id FROM signal_fills').map(r => r.id));
   run('DELETE FROM signals');
   run('DELETE FROM signal_fills');
   signals.forEach(s => run(`INSERT INTO signals (id, user_id, platform, symbol, direction, signal_price, signal_qty, signaled_at, strategy_name, backtest_ref, import_batch_id, created_at)
@@ -3758,12 +3805,15 @@ const SYNC_TABLES = [
   { name: 'import_batches', wm: 'created_at' },
   { name: 'trades', wm: 'updated_at' },
   { name: 'trade_plans', wm: 'updated_at' },
-  { name: 'discipline_rules', wm: 'created_at' },
+  { name: 'discipline_rules', wm: 'updated_at' },
   { name: 'rule_violations', wm: 'created_at' },
   { name: 'review_reports', wm: 'updated_at' },
   { name: 'signals', wm: 'created_at' },
   { name: 'signal_fills', wm: 'created_at' },
 ];
+
+// 表名 → 水位列（pull 应用删除时的 LWW 护栏用；同时充当客户端表白名单）
+const TABLE_WM = Object.fromEntries(SYNC_TABLES.map(t => [t.name, t.wm]));
 
 function getAuth() {
   try { return JSON.parse(localStorage.getItem(AUTH_KEY) || 'null'); } catch (e) { return null; }
@@ -3815,9 +3865,9 @@ async function syncNow() {
   if (!auth) return null;                       // 未登录：静默跳过
   const wm = getWM();
   const sinceMap = {}, payload = {};
-  let pushed = 0, pulled = 0;
+  let pushed = 0, pulled = 0, deleted = 0;
 
-  // —— push：本地水位之后的变更 ——
+  // —— push：本地水位之后的变更 + 删除墓碑 ——
   for (const t of SYNC_TABLES) {
     const since = Math.max(0, (wm[t.name] || 0) - SYNC_MARGIN_SEC);
     const rows = q(
@@ -3827,10 +3877,16 @@ async function syncNow() {
     if (rows.length) { payload[t.name] = rows; pushed += rows.length; }
     sinceMap[t.name] = since;
   }
-  const pushResp = await api('/api/sync/push', { tables: payload });
+  const delSince = Math.max(0, (wm._deletes || 0) - SYNC_MARGIN_SEC);
+  const deletes = q(
+    'SELECT table_name, id, deleted_at FROM sync_tombstones WHERE user_id=$u AND deleted_at > $s',
+    { $u: LOCAL_USER_ID, $s: delSince }
+  ).map(r => ({ table: r.table_name, id: r.id, deleted_at: r.deleted_at }));
+  sinceMap._deletes = delSince;
+  const pushResp = await api('/api/sync/push', { tables: payload, deletes });
   const serverNow = pushResp.server_time;
 
-  // —— pull：服务端水位之后的变更（user_id 改写回 local-user） ——
+  // —— pull：服务端水位之后的变更（user_id 改写回 local-user） + 删除墓碑 ——
   const pullResp = await api('/api/sync/pull', { since: sinceMap });
   for (const t of SYNC_TABLES) {
     const rows = pullResp.tables[t.name] || [];
@@ -3843,11 +3899,21 @@ async function syncNow() {
       pulled++;
     }
   }
+  // 删除传播：先 upsert 后删除——LWW 护栏只删「水位列不晚于删除时间」的行，
+  // 防止陈旧墓碑误删删除之后重建的新内容（确定性 ID 同 ID 复用场景）
+  for (const d of (pullResp.deletes || [])) {
+    const wmCol = TABLE_WM[d.table];
+    if (!wmCol || typeof d.id !== 'string' || !d.id) continue;
+    run(`DELETE FROM ${d.table} WHERE id=$id AND user_id=$u AND COALESCE(${wmCol}, created_at) <= $ts`,
+      { $id: d.id, $u: LOCAL_USER_ID, $ts: d.deleted_at });
+    if (q1('SELECT changes() c').c) deleted++;
+  }
 
   // 水位推进到服务端时间（双端时间不一致时以服务端为准，避免漏拉）
   for (const t of SYNC_TABLES) wm[t.name] = serverNow;
+  wm._deletes = serverNow;
   saveWM(wm);
-  return { pushed, pulled, server_time: serverNow };
+  return { pushed, pulled, deleted, server_time: serverNow };
 }
 
 // 登录后首次调用：本地有数据则推送迁移，本地为空则全量拉取
