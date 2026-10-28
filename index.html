@@ -2342,12 +2342,14 @@ function computeSignalAccuracy() {
   const g = p => (groups[p] = groups[p] || {
     platform: p, total: 0, buyTotal: 0, executed: 0,
     closed: 0, wins: 0, pnl: 0, slipSum: 0, slipN: 0,
+    rSum: 0, rN: 0, rArr: [],
   });
   // 分标的下钻（同一套口径，group key 换成 symbol）
   const symGroups = {};
   const gs = sym => (symGroups[sym] = symGroups[sym] || {
     symbol: sym, total: 0, buyTotal: 0, executed: 0,
     closed: 0, wins: 0, pnl: 0, slipSum: 0, slipN: 0,
+    rSum: 0, rN: 0, rArr: [],
   });
   signals.forEach(s => {
     const grp = g(s.platform || 'other');
@@ -2395,18 +2397,38 @@ function computeSignalAccuracy() {
     grp.closed++;
     grp.pnl += c.pnl;
     if (c.pnl > 0) grp.wins++;
+    // R 倍数：盈亏 ÷ 单笔名义风险（Edgewonk 核心口径；名义风险 = 配对成本 × 7% 止损假设）
+    const risk = Math.abs(c.cost * 0.07);
+    if (risk > 0) {
+      const r = c.pnl / risk;
+      grp.rSum += r; grp.rN++; grp.rArr.push(r);
+    }
     const sg = gs(s.symbol);
     sg.closed++;
     sg.pnl += c.pnl;
     if (c.pnl > 0) sg.wins++;
+    if (risk > 0) {
+      const r = c.pnl / risk;
+      sg.rSum += r; sg.rN++; sg.rArr.push(r);
+    }
   }
 
-  const fin = x => ({
-    ...x,
-    pnl: Math.round(x.pnl * 100) / 100,
-    winRate: x.closed ? x.wins / x.closed : null,
-    avgSlip: x.slipN ? Math.round((x.slipSum / x.slipN) * 10000) / 10000 : null,
-  });
+  const fin = x => {
+    const rs = x.rArr.slice().sort((a, b) => a - b);
+    return {
+      ...x,
+      pnl: Math.round(x.pnl * 100) / 100,
+      winRate: x.closed ? x.wins / x.closed : null,
+      avgSlip: x.slipN ? Math.round((x.slipSum / x.slipN) * 10000) / 10000 : null,
+      avgR: x.rN ? Math.round((x.rSum / x.rN) * 100) / 100 : null,
+      expectancy: x.closed ? Math.round((x.pnl / x.closed) * 100) / 100 : null,
+      profitFactor: rs.length ? (() => {
+        const pos = rs.filter(r => r > 0).reduce((s, r) => s + r, 0);
+        const neg = Math.abs(rs.filter(r => r < 0).reduce((s, r) => s + r, 0));
+        return neg > 0 ? Math.round((pos / neg) * 100) / 100 : null;
+      })() : null,
+    };
+  };
   const rows = Object.values(groups).map(fin).sort((a, b) => b.total - a.total);
   // 分标的：按已闭环数降序，闭环相同按 |盈亏| 降序，最多展示 10 行
   const bySymbol = Object.values(symGroups).map(fin)
@@ -2419,6 +2441,8 @@ function computeSignalAccuracy() {
     closed: rows.reduce((s, x) => s + x.closed, 0),
     wins: rows.reduce((s, x) => s + x.wins, 0),
     pnl: Math.round(rows.reduce((s, x) => s + x.pnl, 0) * 100) / 100,
+    avgR: rows.length ? Math.round((rows.reduce((s, x) => s + (x.avgR || 0), 0) / rows.length) * 100) / 100 : null,
+    expectancy: rows.length ? Math.round((rows.reduce((s, x) => s + (x.expectancy || 0), 0) / rows.length) * 100) / 100 : null,
   } : null;
   if (overall) overall.winRate = overall.closed ? overall.wins / overall.closed : null;
 
@@ -2665,12 +2689,13 @@ function renderSignal(el) {
       </div>
       <p class="text-xs text-slate-400 mb-3 leading-relaxed">
         口径：闭环配对的「首笔开仓成交」被信号匹配即归属（多信号命中同一笔只计最早一条）；仅买入信号参与盈亏归因，卖出信号只统计执行/漏跟；未闭环持仓不计入胜率。
+        R 倍数 = 配对盈亏 ÷ 名义风险（成本 × 7% 止损假设），期望值 = 总盈亏 ÷ 已闭环笔数，盈亏比 = 总盈利 ÷ |总亏损|（均基于 R）。
         本统计是对历史跟单结果的事后核对，<span class="text-slate-500">历史表现不代表未来，不构成对任何信号来源的推荐或评价</span>。
       </p>
       <div class="grid grid-cols-1 lg:grid-cols-2 gap-4">
         <div class="overflow-x-auto"><table class="min-w-full text-sm">
           <thead class="bg-slate-50 text-slate-500 text-xs"><tr>
-            ${['信号来源', '信号数', '买入', '已执行', '已闭环', '跟单胜率', '跟单盈亏', '均滑点'].map(h => `<th class="px-3 py-2 text-left font-medium">${h}</th>`).join('')}
+            ${['信号来源', '信号数', '买入', '已执行', '已闭环', '跟单胜率', '均 R', '期望值/笔', '盈亏比', '跟单盈亏', '均滑点'].map(h => `<th class="px-3 py-2 text-left font-medium">${h}</th>`).join('')}
           </tr></thead>
           <tbody>${acc.rows.map(r => `<tr class="border-t border-slate-100">
             <td class="px-3 py-2">${PLATFORM_LABEL[r.platform] || esc(r.platform)}</td>
@@ -2679,6 +2704,9 @@ function renderSignal(el) {
             <td class="px-3 py-2 text-right">${r.executed}</td>
             <td class="px-3 py-2 text-right">${r.closed}</td>
             <td class="px-3 py-2 text-right font-medium ${r.winRate === null ? 'text-slate-400' : r.winRate >= 0.5 ? 'text-red-600' : 'text-green-600'}">${r.winRate !== null ? fmtPct(r.winRate) : '—'}</td>
+            <td class="px-3 py-2 text-right font-medium ${r.avgR === null ? 'text-slate-400' : r.avgR >= 0 ? 'text-red-600' : 'text-green-600'}">${r.avgR !== null ? (r.avgR >= 0 ? '+' : '') + r.avgR.toFixed(2) + 'R' : '—'}</td>
+            <td class="px-3 py-2 text-right ${r.expectancy === null ? 'text-slate-400' : r.expectancy >= 0 ? 'text-red-600' : 'text-green-600'}">${r.expectancy !== null ? (r.expectancy >= 0 ? '+' : '') + fmtMoney(r.expectancy) : '—'}</td>
+            <td class="px-3 py-2 text-right ${r.profitFactor === null ? 'text-slate-400' : r.profitFactor >= 1 ? 'text-red-600' : 'text-green-600'}">${r.profitFactor !== null ? r.profitFactor.toFixed(2) : '—'}</td>
             <td class="px-3 py-2 text-right font-medium ${r.closed === 0 ? 'text-slate-400' : r.pnl >= 0 ? 'text-red-600' : 'text-green-600'}">${r.closed ? (r.pnl >= 0 ? '+' : '') + fmtMoney(r.pnl) : '—'}</td>
             <td class="px-3 py-2 text-right ${r.avgSlip === null ? 'text-slate-400' : r.avgSlip > 0 ? 'text-red-600' : r.avgSlip < 0 ? 'text-green-600' : 'text-slate-600'}">${r.avgSlip !== null ? fmtMoney(r.avgSlip) : '—'}</td>
           </tr>`).join('')}</tbody></table></div>
