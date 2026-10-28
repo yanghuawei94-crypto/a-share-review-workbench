@@ -544,6 +544,19 @@ const BUILTIN_TEMPLATES = [
     headers: ['日期', '时间', '证券代码', '证券名称', '操作', '成交均价', '成交数量', '成交金额', '手续费', '印花税', '过户费'],
     mapping: { '日期': 'traded_date', '时间': 'traded_time', '证券代码': 'symbol', '证券名称': 'symbol_name', '操作': 'direction', '成交均价': 'price', '成交数量': 'quantity', '成交金额': 'amount', '手续费': 'commission', '印花税': 'stamp_tax', '过户费': 'transfer_fee' },
   },
+  // 以下两家为常见导出变体；配合 import.js 的子集命中（映射列 ⊆ 文件表头即可），
+  // 列序不同 / 多合同编号等噪音列都能命中。真实文件若仍未命中会落入映射工具，
+  // 保存为自定义模板后同格式永久免配置。
+  {
+    broker_name: '通达信通用（多券商 PC 端）',
+    headers: ['成交日期', '成交时间', '证券代码', '证券名称', '买卖标志', '成交价格', '成交数量', '成交金额', '手续费', '印花税', '过户费', '合同编号'],
+    mapping: { '成交日期': 'traded_date', '成交时间': 'traded_time', '证券代码': 'symbol', '证券名称': 'symbol_name', '买卖标志': 'direction', '成交价格': 'price', '成交数量': 'quantity', '成交金额': 'amount', '手续费': 'commission', '印花税': 'stamp_tax', '过户费': 'transfer_fee' },
+  },
+  {
+    broker_name: '中信证券',
+    headers: ['成交日期', '成交时间', '证券代码', '证券名称', '买卖', '成交价格', '成交数量', '成交金额', '佣金', '印花税', '过户费'],
+    mapping: { '成交日期': 'traded_date', '成交时间': 'traded_time', '证券代码': 'symbol', '证券名称': 'symbol_name', '买卖': 'direction', '成交价格': 'price', '成交数量': 'quantity', '成交金额': 'amount', '佣金': 'commission', '印花税': 'stamp_tax', '过户费': 'transfer_fee' },
+  },
 ];
 
 // 内置纪律规则模板 ≥5 条（A 股特色，P0-M4）
@@ -1365,13 +1378,33 @@ async function handleFile(file, el) {
 
   // 模板自动命中：表头哈希匹配 broker_templates.sample_hash
   const hash = simpleHash(headers.join(','));
-  const tpl = q1('SELECT * FROM broker_templates WHERE sample_hash=$h', { $h: hash });
+  let tpl = q1('SELECT * FROM broker_templates WHERE sample_hash=$h', { $h: hash });
+  if (!tpl) tpl = subsetMatchTemplate(headers);
   if (tpl) {
     const mapping = JSON.parse(tpl.column_mapping);
     doImport({ el, file, fileHash, rows: dataRows, headers, mapping, templateId: tpl.id, templateName: tpl.broker_name });
   } else {
     renderMapper(el, { file, fileHash, headers, dataRows });
   }
+}
+
+// 子集命中：模板 column_mapping 覆盖 6 个必填字段、且映射列名全部存在于文件表头即可命中，
+// 与列序、额外噪音列无关（doImport 按列名取索引，多余列天然不参与）。
+// 解决「同一券商不同版本导出差一列就指纹失效」的问题；多个模板同时满足时取映射列最多者。
+function subsetMatchTemplate(headers) {
+  const REQUIRED = ['traded_date', 'symbol', 'direction', 'price', 'quantity', 'amount'];
+  const inFile = new Set(headers.map(h => String(h || '').trim()));
+  let best = null, bestKeys = 0;
+  for (const t of q('SELECT * FROM broker_templates')) {
+    let mapping;
+    try { mapping = JSON.parse(t.column_mapping); } catch (e) { continue; }
+    const keys = Object.keys(mapping);
+    const fields = Object.values(mapping);
+    if (!REQUIRED.every(f => fields.includes(f))) continue;
+    if (!keys.every(k => inFile.has(k))) continue;
+    if (keys.length > bestKeys) { best = t; bestKeys = keys.length; }
+  }
+  return best;
 }
 
 // 通用 CSV 映射工具（US-03）：前 5 行预览 + 列->标准字段下拉
