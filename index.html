@@ -112,6 +112,7 @@ td { font-variant-numeric: tabular-nums; }
       </div>
       <nav id="nav" class="flex-1 p-3 space-y-1 overflow-y-auto"></nav>
       <div class="p-3 border-t border-slate-100 space-y-2">
+        <button id="btn-account" class="w-full text-xs px-3 py-2 rounded-lg bg-slate-100 hover:bg-slate-200 text-slate-600">☁ 登录 / 云端同步</button>
         <button id="btn-export" class="w-full text-xs px-3 py-2 rounded-lg bg-slate-100 hover:bg-slate-200 text-slate-600">导出 .sqlite 数据库文件</button>
         <div id="user-badge" class="text-xs text-slate-400 text-center"></div>
         <p class="text-[10px] text-slate-300 text-center leading-relaxed">数据仅存本地浏览器<br>投资有风险，入市需谨慎</p>
@@ -132,7 +133,7 @@ td { font-variant-numeric: tabular-nums; }
   <script>
 
 // ============================================================
-// ===== 拼接文件 1/10：js/db.js =====
+// ===== 拼接文件 1/11：js/db.js =====
 // ============================================================
 // ============================================================
 // db.js — sql.js(SQLite WASM) 封装 + DDL 初始化 + IndexedDB 持久化
@@ -326,6 +327,18 @@ function scheduleSave() {
   saveTimer = setTimeout(async () => {
     try { await idbSet(DUMP_KEY, db.export()); } catch (e) { console.error('持久化失败', e); }
   }, 300);
+  // 页面隐藏/关闭时尽力立即落库——防抖 300ms 窗口内的刷新/关标签会丢最后一段写入，
+  // 导入完就关页面是真实场景，必须兜住（beforeunload 里 IndexedDB 写通常能完成）
+  if (!scheduleSave._bound) {
+    scheduleSave._bound = true;
+    const flush = () => {
+      if (!db) return;
+      clearTimeout(saveTimer);
+      try { idbSet(DUMP_KEY, db.export()); } catch (e) { /* 尽力而为 */ }
+    };
+    document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'hidden') flush(); });
+    window.addEventListener('pagehide', flush);
+  }
 }
 
 // 「导出 .sqlite 文件」按钮：浏览器下载当前数据库快照
@@ -422,7 +435,8 @@ CREATE TABLE IF NOT EXISTS trades (
     tags            TEXT,                       -- JSON 数组：用户标签（人工）
     pair_id         TEXT,                       -- FIFO 配对 ID [确定性]
     is_t1_locked    INTEGER NOT NULL DEFAULT 0, -- T+1 当日买入锁定 [确定性]
-    created_at      INTEGER NOT NULL
+    created_at      INTEGER NOT NULL,
+    updated_at      INTEGER                     -- 同步水位（仅人工编辑时打点；派生列重算不打）
 );
 CREATE INDEX IF NOT EXISTS idx_trades_user_symbol ON trades(user_id, symbol, traded_at);
 CREATE INDEX IF NOT EXISTS idx_trades_pair ON trades(pair_id);
@@ -437,7 +451,8 @@ CREATE TABLE IF NOT EXISTS trade_plans (
     checklist_json  TEXT NOT NULL,              -- {买入理由,止损位,目标仓位,持有周期假设}（人工）
     status          TEXT NOT NULL DEFAULT 'open', -- open / executed / expired / cancelled [确定性]
     matched_trade_id TEXT REFERENCES trades(id),  -- [确定性:标的+时间窗口匹配]
-    created_at      INTEGER NOT NULL
+    created_at      INTEGER NOT NULL,
+    updated_at      INTEGER                     -- 同步水位（状态流转时打点）
 );
 CREATE INDEX IF NOT EXISTS idx_plans_user ON trade_plans(user_id, status);
 
@@ -495,6 +510,7 @@ CREATE TABLE IF NOT EXISTS review_reports (
     llm_prompt_ver  TEXT,                       -- [LLM]
     compliance_scan TEXT,                       -- [确定性:词表匹配]
     created_at      INTEGER NOT NULL,
+    updated_at      INTEGER,                    -- 同步水位（LLM 文本列二次写入时打点）
     UNIQUE(user_id, period)
 );
 
@@ -574,9 +590,35 @@ async function initDB() {
   const dump = await idbGet(DUMP_KEY);
   db = dump ? new SQL.Database(new Uint8Array(dump)) : new SQL.Database();
   db.exec(DDL);
+  migrate();
   seed();
   scheduleSave();
   return db;
+}
+
+// 轻量迁移：为存量库补 updated_at（Phase 1 同步水位）。新列允许 NULL，
+// 回填为 created_at，使「从未编辑过」的旧行也参与首次全量同步。
+function migrate() {
+  for (const t of ['trades', 'trade_plans', 'review_reports']) {
+    try { db.run(`ALTER TABLE ${t} ADD COLUMN updated_at INTEGER`); } catch (e) { /* 列已存在 */ }
+    run(`UPDATE ${t} SET updated_at=created_at WHERE updated_at IS NULL`);
+  }
+  // 内置纪律规则收敛为确定性 ID（'builtin-'+rule_key）：多端各自播种时 ID 一致，
+  // 云端 INSERT OR REPLACE 才会幂等去重；否则每台设备 5 条规则会变成 N×5 条。
+  // 存量随机 UUID 规则：保留最早一条改写 ID，删除重复（其违规由引擎确定性重跑补齐）。
+  for (const r of BUILTIN_RULES) {
+    const fixed = 'builtin-' + r.rule_key;
+    const rows = q('SELECT id FROM discipline_rules WHERE user_id=$u AND rule_key=$k ORDER BY created_at, id', { $u: LOCAL_USER_ID, $k: r.rule_key });
+    if (!rows.length) continue;
+    for (const dup of rows.slice(1)) {
+      run('DELETE FROM rule_violations WHERE rule_id=$id', { $id: dup.id });
+      run('DELETE FROM discipline_rules WHERE id=$id', { $id: dup.id });
+    }
+    if (rows[0].id !== fixed) {
+      run('UPDATE rule_violations SET rule_id=$new WHERE rule_id=$old', { $new: fixed, $old: rows[0].id });
+      run('UPDATE discipline_rules SET id=$new WHERE id=$old', { $new: fixed, $old: rows[0].id });
+    }
+  }
 }
 
 function seed() {
@@ -603,7 +645,7 @@ function seed() {
     if (!exists) {
       run(`INSERT INTO discipline_rules (id, user_id, rule_key, rule_name, params_json, is_builtin_tpl, enabled, created_at)
            VALUES ($id, $u, $k, $n, $p, 1, 1, $ts)`, {
-        $id: uuid(), $u: LOCAL_USER_ID, $k: r.rule_key, $n: r.rule_name, $p: JSON.stringify(r.params), $ts: ts,
+        $id: 'builtin-' + r.rule_key, $u: LOCAL_USER_ID, $k: r.rule_key, $n: r.rule_name, $p: JSON.stringify(r.params), $ts: ts,
       });
     }
   }
@@ -611,7 +653,7 @@ function seed() {
 
 
 // ============================================================
-// ===== 拼接文件 2/10：js/ui.js =====
+// ===== 拼接文件 2/11：js/ui.js =====
 // ============================================================
 // ============================================================
 // ui.js — 共享 UI 原语（模态框骨架 / HTML 转义 / 通用渲染助手）
@@ -657,7 +699,7 @@ function openModal(opts) {
 
 
 // ============================================================
-// ===== 拼接文件 3/10：js/ledger.js =====
+// ===== 拼接文件 3/11：js/ledger.js =====
 // ============================================================
 // ============================================================
 // ledger.js — 复盘账本（P0-M2）：流水视图 + FIFO 配对 + T+1 校验 + 笔记/标签
@@ -925,8 +967,8 @@ function openNoteEditor(tradeId, onSaved) {
   root.querySelector('#ne-cancel').onclick = () => root.innerHTML = '';
   root.querySelector('#ne-save').onclick = () => {
     const tagArr = root.querySelector('#ne-tags').value.split(/[,，]/).map(s => s.trim()).filter(Boolean);
-    run('UPDATE trades SET tags=$t, note=$n WHERE id=$id', {
-      $t: JSON.stringify(tagArr), $n: root.querySelector('#ne-note').value.trim(), $id: tradeId,
+    run('UPDATE trades SET tags=$t, note=$n, updated_at=$ts WHERE id=$id', {
+      $t: JSON.stringify(tagArr), $n: root.querySelector('#ne-note').value.trim(), $id: tradeId, $ts: now(),
     });
     root.innerHTML = '';
     onSaved && onSaved();
@@ -935,7 +977,7 @@ function openNoteEditor(tradeId, onSaved) {
 
 
 // ============================================================
-// ===== 拼接文件 4/10：js/discipline.js =====
+// ===== 拼接文件 4/11：js/discipline.js =====
 // ============================================================
 // ============================================================
 // discipline.js — 纪律系统（P0-M4）
@@ -951,10 +993,12 @@ function runRuleEngine() {
   if (!trades.length) return;
 
   const pairs = computePairs(trades);
+  // 违规 ID 确定性（'rv-'+rule_id+'-'+trade_id）：引擎全量重跑 DELETE+INSERT 后 ID 不变，
+  // 多设备同步 upsert 幂等收敛；若用随机 UUID，每次重跑都会在云端叠加一套新违规。
   const add = (rule, trade, evidence, violatedAt) => {
     run(`INSERT INTO rule_violations (id, user_id, rule_id, trade_id, rule_snapshot, evidence_json, violated_at, created_at)
          VALUES ($id, $u, $rid, $tid, $snap, $ev, $va, $ts)`, {
-      $id: uuid(), $u: LOCAL_USER_ID, $rid: rule.id, $tid: trade.id,
+      $id: 'rv-' + rule.id + '-' + trade.id, $u: LOCAL_USER_ID, $rid: rule.id, $tid: trade.id,
       $snap: rule.params_json, $ev: JSON.stringify(evidence), $va: violatedAt, $ts: now(),
     });
   };
@@ -1033,9 +1077,9 @@ function reMatchPlans() {
                   AND traded_at BETWEEN $a AND $b ORDER BY traded_at LIMIT 1`,
       { $u: LOCAL_USER_ID, $s: p.symbol, $a: p.plan_window_start, $b: p.plan_window_end });
     const expired = !m && p.plan_window_end < now();
-    run('UPDATE trade_plans SET status=$st, matched_trade_id=$mt WHERE id=$id', {
+    run('UPDATE trade_plans SET status=$st, matched_trade_id=$mt, updated_at=$ts WHERE id=$id', {
       $st: m ? 'executed' : (expired ? 'expired' : 'open'),
-      $mt: m ? m.id : null, $id: p.id,
+      $mt: m ? m.id : null, $id: p.id, $ts: now(),
     });
   }
 }
@@ -1261,7 +1305,7 @@ function renderPlans(el) {
 
 
 // ============================================================
-// ===== 拼接文件 5/10：js/import.js =====
+// ===== 拼接文件 5/11：js/import.js =====
 // ============================================================
 // ============================================================
 // import.js — 交割单导入中心（P0-M1）
@@ -1521,6 +1565,7 @@ function doImport({ el, file, fileHash, rows, headers, mapping, templateId, temp
   runRuleEngine();   // 纪律规则跑批
   alert(`导入完成（模板：${templateName}）\n成功 ${ok} 行，失败 ${errors.length} 行${errors.length ? '\n失败原因可在批次记录 parse_errors 查看' : ''}`);
   renderImport(el);
+  autoSync();        // 已登录时静默推送（未登录为 no-op）
 }
 
 // ---------- 模拟数据（确定性 RNG，评审可复现；mulberry32 见 db.js） ----------
@@ -1621,8 +1666,9 @@ function generateMock(el) {
   repairAll();
   reMatchPlans();
   runRuleEngine();
-  alert(`已生成 ${rows.length} 笔模拟成交（2026-07-27 ~ 2026-10-27），含故意埋入的违规样本，去「归因看板」和「纪律系统」查看效果。`);
+  alert(`已生成 ${rows.length} 笔模拟成交（2026-07-27 至 2026-10-27），含故意埋入的违规样本，去「归因看板」和「纪律系统」查看效果。`);
   renderImport(el);
+  autoSync();
 }
 
 // ---------- 样例 CSV 下载（供评审走真实导入流程） ----------
@@ -1652,7 +1698,7 @@ function downloadSample(which) {
 
 
 // ============================================================
-// ===== 拼接文件 6/10：js/analytics.js =====
+// ===== 拼接文件 6/11：js/analytics.js =====
 // ============================================================
 // ============================================================
 // analytics.js — 基础归因看板（P0-M3，默认首页）
@@ -1911,7 +1957,7 @@ function showClosedTrace(title, list) {
 
 
 // ============================================================
-// ===== 拼接文件 7/10：js/signal.js =====
+// ===== 拼接文件 7/11：js/signal.js =====
 // ============================================================
 // ============================================================
 // signal.js — P1-M6 信号 vs 成交三层对照
@@ -2095,9 +2141,9 @@ function autoMatch() {
       t.traded_at >= sig.signaled_at && t.traded_at <= sig.signaled_at + 3600
     );
     if (!candidates.length) {
-      // missed（漏跟单）
+      // missed（漏跟单）；fill ID 确定性：autoMatch 全量 DELETE+重建后 ID 不变，多端同步幂等
       fills.push({
-        id: uuid(), user_id: LOCAL_USER_ID, signal_id: sig.id, trade_id: null,
+        id: 'sf-m-' + sig.id, user_id: LOCAL_USER_ID, signal_id: sig.id, trade_id: null,
         match_status: 'missed', slippage: null, delay_seconds: null,
         deviation_amount: null, match_rule_version: 'v1', created_at: ts,
       });
@@ -2124,7 +2170,7 @@ function autoMatch() {
     // 逐成交写 signal_fills（每个 matched trade 一条 fill）
     matchedTradeIds.forEach((tradeId, i) => {
       fills.push({
-        id: uuid(), user_id: LOCAL_USER_ID, signal_id: sig.id, trade_id: tradeId,
+        id: 'sf-' + sig.id + '-' + tradeId, user_id: LOCAL_USER_ID, signal_id: sig.id, trade_id: tradeId,
         match_status: i === matchedTradeIds.length - 1 ? status : 'partial',
         slippage, delay_seconds: delay, deviation_amount: deviation,
         match_rule_version: 'v1', created_at: ts,
@@ -2141,7 +2187,7 @@ function autoMatch() {
     );
     if (!inSignalWindow) {
       fills.push({
-        id: uuid(), user_id: LOCAL_USER_ID, signal_id: null, trade_id: t.id,
+        id: 'sf-x-' + t.id, user_id: LOCAL_USER_ID, signal_id: null, trade_id: t.id,
         match_status: 'extra', slippage: null, delay_seconds: null,
         deviation_amount: null, match_rule_version: 'v1', created_at: ts,
       });
@@ -2408,6 +2454,7 @@ function generateMockSignals() {
 
   autoMatch();
   alert(`已播种 ${signals.length} 条模拟信号（含 missed）+ autoMatch 完成`);
+  autoSync();
 }
 
 // ---------- 最近一次导入的识别结果（供页面展示，可审计） ----------
@@ -2469,6 +2516,7 @@ async function handleSignalFile(file) {
   autoMatch();
   LAST_IMPORT = { ok: res.ok.length, err: res.errors.length, dup: res.dupCount || 0, mapping: res.mapping, unmapped: res.unmapped, errors: res.errors.slice(0, 5) };
   alert(`信号导入成功 ${res.ok.length} 条（失败 ${res.errors.length} 行，重复剔除 ${res.dupCount || 0} 行）\n\n字段识别：${res.mapping || '无'}`);
+  autoSync();
   return res.ok.length;
 }
 
@@ -2708,7 +2756,7 @@ function renderSignal(el) {
 
 
 // ============================================================
-// ===== 拼接文件 8/10：js/llm.js =====
+// ===== 拼接文件 8/11：js/llm.js =====
 // ============================================================
 // ============================================================
 // llm.js — LLM 接入层（从 report.js 拆出，架构红线物理隔离）
@@ -3080,7 +3128,7 @@ function complianceScan(reportText, summaryText = '') {
 
 
 // ============================================================
-// ===== 拼接文件 9/10：js/report.js =====
+// ===== 拼接文件 9/11：js/report.js =====
 // ============================================================
 // ============================================================
 // report.js — P1-M5 AI 月度体检报告
@@ -3264,7 +3312,7 @@ function persistReport(metrics, llmText) {
 
   // —— 第 2 次：只 UPDATE LLM 文本列（不再触碰任何数值列） ——
   run(`UPDATE review_reports
-        SET report_text=$rt, summary_text=$st, llm_model=$m, llm_prompt_ver=$v
+        SET report_text=$rt, summary_text=$st, llm_model=$m, llm_prompt_ver=$v, updated_at=$ts
         WHERE user_id=$u AND period=$period`, {
     $rt: llmText.report_text,
     $st: llmText.summary_text,
@@ -3272,6 +3320,7 @@ function persistReport(metrics, llmText) {
     $v: llmText.llm_prompt_ver,
     $u: LOCAL_USER_ID,
     $period: metrics.period,
+    $ts: ts,
   });
 
   return id;
@@ -3285,6 +3334,7 @@ async function generateReportFor(period) {
   // 走真实 LLM（已配置 API 时）；未配置 / 调用失败 / 输出越界 → 自动回退模板引擎
   const llmText = await callLLMAPI(metrics);
   persistReport(metrics, llmText);
+  autoSync();   // 已登录时静默推送（未登录为 no-op）
   return { metrics, llmText };
 }
 
@@ -3683,7 +3733,154 @@ function renderReport(el) {
 
 
 // ============================================================
-// ===== 拼接文件 10/10：js/app.js =====
+// ===== 拼接文件 10/11：js/sync.js =====
+// ============================================================
+// ============================================================
+// sync.js — Phase 1 云端账号 + 数据同步层
+// 设计红线：
+//   1. 计算永远留在浏览器；本层只做 push/pull，不碰任何指标计算
+//   2. 本地仍写 local-user；推送时服务端强制覆盖为真实 uid，
+//      拉取时把 user_id 改写回 local-user —— 其余页面代码零改动
+//   3. 增量水位：append-only 表看 created_at，可更新表（trades /
+//      trade_plans / review_reports）看 updated_at；冲突规则客户端优先
+//      （INSERT OR REPLACE，最后写入者胜）
+//   4. 未登录时一切为静默 no-op（离线版/演示版行为完全不变）
+// ============================================================
+
+const AUTH_KEY = 'trae_auth_v1';       // {serverUrl, email, uid, token}
+const WM_KEY = 'trae_sync_wm_v1';      // 每表水位 {table: ts}
+// 秒级水位安全边距：编辑与上次同步落在同一秒时，严格大于会漏掉该行；
+// 回拨 2 秒会重复推送/拉取少量行，由 INSERT OR REPLACE 幂等吸收，无副作用
+const SYNC_MARGIN_SEC = 2;
+
+// 同步表清单：append-only 用 created_at；updatable 用 updated_at（迁移已回填）
+const SYNC_TABLES = [
+  { name: 'import_batches', wm: 'created_at' },
+  { name: 'trades', wm: 'updated_at' },
+  { name: 'trade_plans', wm: 'updated_at' },
+  { name: 'discipline_rules', wm: 'created_at' },
+  { name: 'rule_violations', wm: 'created_at' },
+  { name: 'review_reports', wm: 'updated_at' },
+  { name: 'signals', wm: 'created_at' },
+  { name: 'signal_fills', wm: 'created_at' },
+];
+
+function getAuth() {
+  try { return JSON.parse(localStorage.getItem(AUTH_KEY) || 'null'); } catch (e) { return null; }
+}
+function saveAuth(a) { localStorage.setItem(AUTH_KEY, JSON.stringify(a)); }
+function logout() { localStorage.removeItem(AUTH_KEY); localStorage.removeItem(WM_KEY); }
+
+function getWM() { try { return JSON.parse(localStorage.getItem(WM_KEY) || '{}'); } catch (e) { return {}; } }
+function saveWM(wm) { localStorage.setItem(WM_KEY, JSON.stringify(wm)); }
+
+async function api(path, body) {
+  const auth = getAuth();
+  if (!auth) throw new Error('未登录');
+  const resp = await fetch(auth.serverUrl.replace(/\/+$/, '') + path, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + auth.token },
+    body: JSON.stringify(body || {}),
+  });
+  const data = await resp.json().catch(() => ({}));
+  if (!resp.ok) throw new Error(data.error || ('HTTP ' + resp.status));
+  return data;
+}
+
+async function register(serverUrl, email, password) {
+  const resp = await fetch(serverUrl.replace(/\/+$/, '') + '/api/auth/register', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ email, password }),
+  });
+  const data = await resp.json().catch(() => ({}));
+  if (!resp.ok) throw new Error(data.error || ('HTTP ' + resp.status));
+  saveAuth({ serverUrl: serverUrl.replace(/\/+$/, ''), email, uid: data.uid, token: data.token });
+  return data;
+}
+
+async function login(serverUrl, email, password) {
+  const resp = await fetch(serverUrl.replace(/\/+$/, '') + '/api/auth/login', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ email, password }),
+  });
+  const data = await resp.json().catch(() => ({}));
+  if (!resp.ok) throw new Error(data.error || ('HTTP ' + resp.status));
+  saveAuth({ serverUrl: serverUrl.replace(/\/+$/, ''), email, uid: data.uid, token: data.token });
+  return data;
+}
+
+// 全量/增量同步主流程。返回 {pushed, pulled} 计数。
+async function syncNow() {
+  const auth = getAuth();
+  if (!auth) return null;                       // 未登录：静默跳过
+  const wm = getWM();
+  const sinceMap = {}, payload = {};
+  let pushed = 0, pulled = 0;
+
+  // —— push：本地水位之后的变更 ——
+  for (const t of SYNC_TABLES) {
+    const since = Math.max(0, (wm[t.name] || 0) - SYNC_MARGIN_SEC);
+    const rows = q(
+      `SELECT * FROM ${t.name} WHERE user_id=$u AND COALESCE(${t.wm}, created_at) > $s`,
+      { $u: LOCAL_USER_ID, $s: since }
+    );
+    if (rows.length) { payload[t.name] = rows; pushed += rows.length; }
+    sinceMap[t.name] = since;
+  }
+  const pushResp = await api('/api/sync/push', { tables: payload });
+  const serverNow = pushResp.server_time;
+
+  // —— pull：服务端水位之后的变更（user_id 改写回 local-user） ——
+  const pullResp = await api('/api/sync/pull', { since: sinceMap });
+  for (const t of SYNC_TABLES) {
+    const rows = pullResp.tables[t.name] || [];
+    for (const r of rows) {
+      r.user_id = LOCAL_USER_ID;
+      const cols = Object.keys(r);
+      run(`INSERT OR REPLACE INTO ${t.name} (${cols.join(',')})
+           VALUES (${cols.map(c => '$' + c).join(',')})`,
+        Object.fromEntries(cols.map(c => ['$' + c, r[c]])));
+      pulled++;
+    }
+  }
+
+  // 水位推进到服务端时间（双端时间不一致时以服务端为准，避免漏拉）
+  for (const t of SYNC_TABLES) wm[t.name] = serverNow;
+  saveWM(wm);
+  return { pushed, pulled, server_time: serverNow };
+}
+
+// 登录后首次调用：本地有数据则推送迁移，本地为空则全量拉取
+async function initialSync() {
+  const wm = getWM();
+  if (!Object.keys(wm).length) {
+    const localTrades = q('SELECT COUNT(*) c FROM trades WHERE user_id=$u', { $u: LOCAL_USER_ID })[0].c;
+    if (localTrades === 0) {
+      // 全新设备：拉取云端全部数据
+      const r = await syncAll(0);
+      return { ...r, mode: 'pull-all' };
+    }
+    return { ...(await syncAll(0)), mode: 'push-migrate' };
+  }
+  return { ...(await syncNow()), mode: 'incremental' };
+}
+
+async function syncAll(zeroSince) {
+  const wm = {};
+  for (const t of SYNC_TABLES) wm[t.name] = zeroSince;
+  saveWM(wm);
+  return syncNow();
+}
+
+// 自动同步钩子：数据变更后静默推送（仅已登录时；失败不打扰用户）
+function autoSync() {
+  if (!getAuth()) return;
+  syncNow().catch(e => console.warn('[sync] 自动同步失败（将在下次手动同步时重试）:', e.message));
+}
+
+
+// ============================================================
+// ===== 拼接文件 11/11：js/app.js =====
 // ============================================================
 // ============================================================
 // app.js — 路由与导航（首屏=归因看板，归因+纪律权重≥70% 硬约束）
@@ -3731,12 +3928,95 @@ async function boot() {
   const user = q1('SELECT * FROM users WHERE id=$id', { $id: LOCAL_USER_ID });
   document.getElementById('user-badge').textContent = `${user.nickname} · ${user.plan_tier === 'free' ? '免费档' : user.plan_tier}`;
   document.getElementById('btn-export').onclick = () => exportSqliteFile();
+  document.getElementById('btn-account').onclick = () => openAccountModal();
+  refreshAccountBadge();
+  // 已登录：启动时静默增量同步一次（失败不阻塞任何功能）
+  if (getAuth()) syncNow().then(() => { refreshAccountBadge(); render(); }).catch(e => console.warn('[sync] 启动同步失败:', e.message));
   mask.remove();
   window.addEventListener('hashchange', render);
   render();
 }
 
 boot();
+
+// ---------- 账号与云端同步（Phase 1） ----------
+function refreshAccountBadge() {
+  const auth = getAuth();
+  const btn = document.getElementById('btn-account');
+  if (!btn) return;
+  btn.textContent = auth ? `☁ ${auth.email}（已同步）` : '☁ 登录 / 云端同步';
+  btn.className = `w-full text-xs px-3 py-2 rounded-lg ${auth ? 'bg-emerald-50 text-emerald-700 hover:bg-emerald-100' : 'bg-slate-100 hover:bg-slate-200 text-slate-600'}`;
+}
+
+function openAccountModal() {
+  const auth = getAuth();
+  const lastSync = localStorage.getItem('trae_sync_last');
+  const root = openModal({
+    title: '账号与云端同步',
+    titleExtra: '数据仍在本地计算，云端仅备份原始明细',
+    width: 'max-w-md',
+    bodyHTML: auth ? `
+      <div class="space-y-4 text-sm">
+        <div class="bg-slate-50 rounded-lg p-3">
+          <div class="text-slate-500 text-xs mb-1">当前账号</div>
+          <div class="font-medium">${esc(auth.email)}</div>
+          <div class="text-xs text-slate-400 mt-1 break-all">${esc(auth.serverUrl)}</div>
+          ${lastSync ? `<div class="text-xs text-slate-400 mt-1">上次同步：${new Date(+lastSync).toLocaleString('zh-CN')}</div>` : ''}
+        </div>
+        <div id="acc-msg" class="text-xs"></div>
+        <div class="flex gap-2">
+          <button id="acc-sync" class="flex-1 px-4 py-2 bg-indigo-600 text-white rounded-lg text-sm hover:bg-indigo-700">立即同步</button>
+          <button id="acc-logout" class="px-4 py-2 bg-slate-100 rounded-lg text-sm hover:bg-slate-200">退出登录</button>
+        </div>
+        <p class="text-xs text-slate-400">同步内容：成交 / 计划 / 规则 / 违规 / 报告 / 信号等原始明细。派生指标在各设备本地重算，口径永远只有一套。</p>
+      </div>` : `
+      <div class="space-y-3 text-sm">
+        <label class="block text-xs text-slate-500">服务地址<input id="acc-server" class="mt-1 w-full border rounded-lg px-3 py-2 text-sm" value="http://127.0.0.1:8790"></label>
+        <label class="block text-xs text-slate-500">邮箱<input id="acc-email" type="email" class="mt-1 w-full border rounded-lg px-3 py-2 text-sm" placeholder="you@example.com"></label>
+        <label class="block text-xs text-slate-500">密码<input id="acc-pass" type="password" class="mt-1 w-full border rounded-lg px-3 py-2 text-sm" placeholder="至少 6 位"></label>
+        <div id="acc-msg" class="text-xs"></div>
+        <div class="flex gap-2">
+          <button id="acc-login" class="flex-1 px-4 py-2 bg-indigo-600 text-white rounded-lg text-sm hover:bg-indigo-700">登录</button>
+          <button id="acc-register" class="flex-1 px-4 py-2 bg-slate-800 text-white rounded-lg text-sm hover:bg-slate-900">注册并登录</button>
+        </div>
+        <p class="text-xs text-slate-400">首次登录会自动完成一次全量迁移：本机已有数据则推送上云；本机为空则从云端拉回。</p>
+      </div>`,
+  });
+
+  const msg = root.querySelector('#acc-msg');
+  const say = (t, ok) => { msg.textContent = t; msg.className = 'text-xs ' + (ok ? 'text-emerald-600' : 'text-red-600'); };
+
+  if (auth) {
+    root.querySelector('#acc-sync').onclick = async () => {
+      say('同步中…', true);
+      try {
+        const r = await syncNow();
+        localStorage.setItem('trae_sync_last', String(Date.now()));
+        say(`完成：推送 ${r.pushed} 条 / 拉取 ${r.pulled} 条`, true);
+        refreshAccountBadge(); render();
+      } catch (e) { say('同步失败：' + e.message, false); }
+    };
+    root.querySelector('#acc-logout').onclick = () => { logout(); document.getElementById('modal-root').innerHTML = ''; refreshAccountBadge(); };
+  } else {
+    const doAuth = async (fn) => {
+      const serverUrl = root.querySelector('#acc-server').value.trim();
+      const email = root.querySelector('#acc-email').value.trim();
+      const password = root.querySelector('#acc-pass').value;
+      if (!serverUrl || !email || password.length < 6) { say('请填写服务地址 / 邮箱，密码至少 6 位', false); return; }
+      say('连接中…', true);
+      try {
+        await fn(serverUrl, email, password);
+        say('登录成功，正在执行首次全量迁移…', true);
+        const r = await initialSync();
+        localStorage.setItem('trae_sync_last', String(Date.now()));
+        say(`迁移完成（${r.mode}）：推送 ${r.pushed} 条 / 拉取 ${r.pulled} 条`, true);
+        refreshAccountBadge(); render();
+      } catch (e) { say(e.message, false); }
+    };
+    root.querySelector('#acc-login').onclick = () => doAuth(login);
+    root.querySelector('#acc-register').onclick = () => doAuth(register);
+  }
+}
 
 
 // ============================================================
@@ -3844,6 +4124,14 @@ boot();
     banner.querySelector('#demo-reset-btn').onclick = resetDemoData;
   }
   mountBanner();
+
+  // —— 3b. 演示版不提供云端同步：每次打开都是全新随机 ID 的模拟数据，
+  //     同步上云只会污染账号（且与横幅「数据不出本地」承诺冲突）。隐藏入口，
+  //     并清除本域下任何已存登录态（autoSync 以 getAuth() 为准，清掉即静默）。
+  const accBtn = document.getElementById('btn-account');
+  if (accBtn) accBtn.style.display = 'none';
+  localStorage.removeItem('trae_auth_v1');
+  localStorage.removeItem('trae_sync_wm_v1');
 
   // —— 2. 等待 app boot 完成（boot-mask 被移除）后播种并刷新看板 ——
   const timer = setInterval(() => {
