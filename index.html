@@ -2220,10 +2220,19 @@ function computeSignalAccuracy() {
     platform: p, total: 0, buyTotal: 0, executed: 0,
     closed: 0, wins: 0, pnl: 0, slipSum: 0, slipN: 0,
   });
+  // 分标的下钻（同一套口径，group key 换成 symbol）
+  const symGroups = {};
+  const gs = sym => (symGroups[sym] = symGroups[sym] || {
+    symbol: sym, total: 0, buyTotal: 0, executed: 0,
+    closed: 0, wins: 0, pnl: 0, slipSum: 0, slipN: 0,
+  });
   signals.forEach(s => {
     const grp = g(s.platform || 'other');
     grp.total++;
     if (s.direction === 'buy') grp.buyTotal++;
+    const sg = gs(s.symbol);
+    sg.total++;
+    if (s.direction === 'buy') sg.buyTotal++;
   });
 
   // trade_id → 信号 id（同笔成交被多信号命中时，最早信号优先）
@@ -2235,7 +2244,7 @@ function computeSignalAccuracy() {
   // 已执行信号（filled/partial，按 signal 去重）
   new Set(fills.map(f => f.signal_id)).forEach(sid => {
     const s = sigById[sid];
-    if (s) g(s.platform || 'other').executed++;
+    if (s) { g(s.platform || 'other').executed++; gs(s.symbol).executed++; }
   });
 
   // 每个信号一条代表 fill（滑点在同一信号的各 fill 上数值相同，取一条即可）
@@ -2247,6 +2256,8 @@ function computeSignalAccuracy() {
     if (!s) return;
     const grp = g(s.platform || 'other');
     grp.slipSum += f.slippage; grp.slipN++;
+    const sg = gs(s.symbol);
+    sg.slipSum += f.slippage; sg.slipN++;
   });
 
   // 闭环配对归因：首笔开仓成交 → 最早命中信号（仅买入信号）
@@ -2261,16 +2272,23 @@ function computeSignalAccuracy() {
     grp.closed++;
     grp.pnl += c.pnl;
     if (c.pnl > 0) grp.wins++;
+    const sg = gs(s.symbol);
+    sg.closed++;
+    sg.pnl += c.pnl;
+    if (c.pnl > 0) sg.wins++;
   }
 
-  const rows = Object.values(groups)
-    .map(x => ({
-      ...x,
-      pnl: Math.round(x.pnl * 100) / 100,
-      winRate: x.closed ? x.wins / x.closed : null,
-      avgSlip: x.slipN ? Math.round((x.slipSum / x.slipN) * 10000) / 10000 : null,
-    }))
-    .sort((a, b) => b.total - a.total);
+  const fin = x => ({
+    ...x,
+    pnl: Math.round(x.pnl * 100) / 100,
+    winRate: x.closed ? x.wins / x.closed : null,
+    avgSlip: x.slipN ? Math.round((x.slipSum / x.slipN) * 10000) / 10000 : null,
+  });
+  const rows = Object.values(groups).map(fin).sort((a, b) => b.total - a.total);
+  // 分标的：按已闭环数降序，闭环相同按 |盈亏| 降序，最多展示 10 行
+  const bySymbol = Object.values(symGroups).map(fin)
+    .sort((a, b) => b.closed - a.closed || Math.abs(b.pnl) - Math.abs(a.pnl))
+    .slice(0, 10);
 
   const overall = rows.length ? {
     total: rows.reduce((s, x) => s + x.total, 0),
@@ -2281,7 +2299,7 @@ function computeSignalAccuracy() {
   } : null;
   if (overall) overall.winRate = overall.closed ? overall.wins / overall.closed : null;
 
-  return { rows, overall };
+  return { rows, bySymbol, overall };
 }
 
 // ---------- 模拟信号（固定种子，演示用；mulberry32 见 db.js） ----------
@@ -2521,20 +2539,36 @@ function renderSignal(el) {
         口径：闭环配对的「首笔开仓成交」被信号匹配即归属（多信号命中同一笔只计最早一条）；仅买入信号参与盈亏归因，卖出信号只统计执行/漏跟；未闭环持仓不计入胜率。
         本统计是对历史跟单结果的事后核对，<span class="text-slate-500">历史表现不代表未来，不构成对任何信号来源的推荐或评价</span>。
       </p>
-      <div class="overflow-x-auto"><table class="min-w-full text-sm">
-        <thead class="bg-slate-50 text-slate-500 text-xs"><tr>
-          ${['信号来源', '信号数', '买入信号', '已执行', '已闭环', '跟单胜率', '跟单盈亏', '平均滑点'].map(h => `<th class="px-4 py-2 text-left font-medium">${h}</th>`).join('')}
-        </tr></thead>
-        <tbody>${acc.rows.map(r => `<tr class="border-t border-slate-100">
-          <td class="px-4 py-2">${PLATFORM_LABEL[r.platform] || esc(r.platform)}</td>
-          <td class="px-4 py-2 text-right">${r.total}</td>
-          <td class="px-4 py-2 text-right">${r.buyTotal}</td>
-          <td class="px-4 py-2 text-right">${r.executed}</td>
-          <td class="px-4 py-2 text-right">${r.closed}</td>
-          <td class="px-4 py-2 text-right font-medium ${r.winRate === null ? 'text-slate-400' : r.winRate >= 0.5 ? 'text-red-600' : 'text-green-600'}">${r.winRate !== null ? fmtPct(r.winRate) : '—'}</td>
-          <td class="px-4 py-2 text-right font-medium ${r.closed === 0 ? 'text-slate-400' : r.pnl >= 0 ? 'text-red-600' : 'text-green-600'}">${r.closed ? (r.pnl >= 0 ? '+' : '') + fmtMoney(r.pnl) : '—'}</td>
-          <td class="px-4 py-2 text-right ${r.avgSlip === null ? 'text-slate-400' : r.avgSlip > 0 ? 'text-red-600' : r.avgSlip < 0 ? 'text-green-600' : 'text-slate-600'}">${r.avgSlip !== null ? fmtMoney(r.avgSlip) : '—'}</td>
-        </tr>`).join('')}</tbody></table></div>
+      <div class="grid grid-cols-1 lg:grid-cols-2 gap-4">
+        <div class="overflow-x-auto"><table class="min-w-full text-sm">
+          <thead class="bg-slate-50 text-slate-500 text-xs"><tr>
+            ${['信号来源', '信号数', '买入', '已执行', '已闭环', '跟单胜率', '跟单盈亏', '均滑点'].map(h => `<th class="px-3 py-2 text-left font-medium">${h}</th>`).join('')}
+          </tr></thead>
+          <tbody>${acc.rows.map(r => `<tr class="border-t border-slate-100">
+            <td class="px-3 py-2">${PLATFORM_LABEL[r.platform] || esc(r.platform)}</td>
+            <td class="px-3 py-2 text-right">${r.total}</td>
+            <td class="px-3 py-2 text-right">${r.buyTotal}</td>
+            <td class="px-3 py-2 text-right">${r.executed}</td>
+            <td class="px-3 py-2 text-right">${r.closed}</td>
+            <td class="px-3 py-2 text-right font-medium ${r.winRate === null ? 'text-slate-400' : r.winRate >= 0.5 ? 'text-red-600' : 'text-green-600'}">${r.winRate !== null ? fmtPct(r.winRate) : '—'}</td>
+            <td class="px-3 py-2 text-right font-medium ${r.closed === 0 ? 'text-slate-400' : r.pnl >= 0 ? 'text-red-600' : 'text-green-600'}">${r.closed ? (r.pnl >= 0 ? '+' : '') + fmtMoney(r.pnl) : '—'}</td>
+            <td class="px-3 py-2 text-right ${r.avgSlip === null ? 'text-slate-400' : r.avgSlip > 0 ? 'text-red-600' : r.avgSlip < 0 ? 'text-green-600' : 'text-slate-600'}">${r.avgSlip !== null ? fmtMoney(r.avgSlip) : '—'}</td>
+          </tr>`).join('')}</tbody></table></div>
+        <div class="overflow-x-auto">
+          <div class="text-xs text-slate-400 mb-2">分标的下钻（按已闭环数排序，Top 10）</div>
+          <table class="min-w-full text-sm">
+          <thead class="bg-slate-50 text-slate-500 text-xs"><tr>
+            ${['标的', '信号数', '已执行', '已闭环', '跟单胜率', '跟单盈亏'].map(h => `<th class="px-3 py-2 text-left font-medium">${h}</th>`).join('')}
+          </tr></thead>
+          <tbody>${acc.bySymbol.length ? acc.bySymbol.map(r => `<tr class="border-t border-slate-100">
+            <td class="px-3 py-2 font-mono">${esc(r.symbol)}</td>
+            <td class="px-3 py-2 text-right">${r.total}</td>
+            <td class="px-3 py-2 text-right">${r.executed}</td>
+            <td class="px-3 py-2 text-right">${r.closed}</td>
+            <td class="px-3 py-2 text-right font-medium ${r.winRate === null ? 'text-slate-400' : r.winRate >= 0.5 ? 'text-red-600' : 'text-green-600'}">${r.winRate !== null ? fmtPct(r.winRate) : '—'}</td>
+            <td class="px-3 py-2 text-right font-medium ${r.closed === 0 ? 'text-slate-400' : r.pnl >= 0 ? 'text-red-600' : 'text-green-600'}">${r.closed ? (r.pnl >= 0 ? '+' : '') + fmtMoney(r.pnl) : '—'}</td>
+          </tr>`).join('') : '<tr><td colspan="6" class="px-3 py-6 text-center text-slate-400">无数据</td></tr>'}</tbody></table></div>
+      </div>
     </div>` : ''}
 
     <div class="grid grid-cols-1 lg:grid-cols-2 gap-4">
