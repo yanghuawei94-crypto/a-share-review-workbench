@@ -2777,10 +2777,13 @@ function renderSignal(el) {
             <td class="px-3 py-2 text-right font-medium ${r.closed === 0 ? 'text-slate-400' : r.pnl >= 0 ? 'text-red-600' : 'text-green-600'}">${r.closed ? (r.pnl >= 0 ? '+' : '') + fmtMoney(r.pnl) : '—'}</td>
           </tr>`).join('') : '<tr><td colspan="6" class="px-3 py-6 text-center text-slate-400">无数据</td></tr>'}</tbody></table></div>
       </div>
-    </div>` : ''}
+    </div>` : `<div class="bg-white rounded-xl border border-dashed border-slate-300 p-6 text-center">
+      <div class="text-sm font-medium text-slate-600 mb-1">尚无跟单结果可统计</div>
+      <p class="text-xs text-slate-400 leading-relaxed">已导入 ${signals.length} 条信号，但还没有匹配到成交记录。<br>请确认成交明细已导入，或检查信号时间与成交时间是否落在 ±3600 秒匹配窗口内。</p>
+    </div>`}
 
     <!-- R 倍数分析：累计曲线 + 分布直方图（基于整体 rDetails） -->
-    ${acc.overall && acc.overall.closed >= 2 ? (() => {
+    ${!acc.overall ? '' : acc.overall.closed >= 2 ? (() => {
       // 合并所有平台的 rDetails（按交易时间排序）
       const allDetails = acc.rows.reduce((s, r) => s.concat(r.rDetails || []), [])
         .sort((a, b) => a.tradedAt - b.tradedAt);
