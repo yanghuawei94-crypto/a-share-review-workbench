@@ -2881,6 +2881,37 @@ function renderSignal(el) {
         else cur = 0;
       }
       const curStreak = cur; // 末尾尚未被盈利打断的连亏笔数
+
+      // 蒙特卡洛：从历史 R 分布有放回抽样，模拟 1000 条「未来 100 笔」资金曲线。
+      // 固定随机种子 -> 同数据同结果，可复现（对齐「指标可溯源」红线）
+      const mcRuns = 1000, mcHorizon = 100;
+      const rPool = allDetails.map(d => d.r);
+      const mcRand = mulberry32(20261029);
+      const mcFinals = [], mcDDs = [];
+      for (let k = 0; k < mcRuns; k++) {
+        let cum = 0, peak = 0, dd = 0;
+        for (let i = 0; i < mcHorizon; i++) {
+          cum += rPool[Math.floor(mcRand() * rPool.length)];
+          if (cum > peak) peak = cum;
+          if (cum - peak < dd) dd = cum - peak;
+        }
+        mcFinals.push(cum); mcDDs.push(dd);
+      }
+      const sortedF = mcFinals.slice().sort((a, b) => a - b);
+      const quantile = q => sortedF[Math.min(sortedF.length - 1, Math.floor(q * sortedF.length))];
+      const mcP5 = quantile(0.05), mcP50 = quantile(0.5), mcP95 = quantile(0.95);
+      const probNeg = mcFinals.filter(v => v < 0).length / mcRuns;
+      const sortedDD = mcDDs.slice().sort((a, b) => a - b);
+      const medDD = sortedDD[Math.floor(sortedDD.length / 2)];
+      const mcMin = sortedF[0], mcMax = sortedF[sortedF.length - 1];
+      const mcSpan = (mcMax - mcMin) || 1;
+      const MCB = 9;
+      const mcBins = Array.from({ length: MCB }, () => 0);
+      for (const v of mcFinals) {
+        const idx = Math.min(MCB - 1, Math.max(0, Math.floor((v - mcMin) / mcSpan * MCB)));
+        mcBins[idx]++;
+      }
+      const mcMaxBin = Math.max(...mcBins) || 1;
       return `
     ${acc.rows.length > 1 ? `<div class="flex flex-wrap items-center gap-1 text-xs mb-3">
       <span class="text-slate-500 mr-1">信号来源</span>
@@ -2975,6 +3006,40 @@ function renderSignal(el) {
         </svg></div>
         <p class="text-xs text-slate-400 mt-2">红柱=亏损区间，绿柱=盈利区间。柱顶百分比=该区间占总交易比例。点击柱子查看标的明细。</p>
         <p class="text-xs mt-1 ${bigLossPct > 20 ? 'text-red-500' : 'text-slate-500'}">形态：${shapeText}；亏损占比 ${lossPct.toFixed(0)}%，≤-1R 大亏损占比 ${bigLossPct.toFixed(0)}%${bigLossPct > 20 ? '（止损执行不到位）' : ''}</p>
+      </div>
+
+      <div class="lg:col-span-2 bg-white rounded-xl border border-slate-200 p-5">
+        <h3 class="font-semibold text-sm mb-1">蒙特卡洛压力测试</h3>
+        <p class="text-xs text-slate-400 mb-4">从历史 ${rPool.length} 个 R 值有放回抽样，模拟 ${mcRuns} 条「未来 ${mcHorizon} 笔」资金曲线。固定随机种子，结果可复现。</p>
+        <div class="grid grid-cols-2 lg:grid-cols-4 gap-3 mb-4">
+          <div class="bg-slate-50 rounded-lg p-3">
+            <div class="text-xs text-slate-500 mb-1">亏损概率</div>
+            <div class="text-2xl font-bold ${probNeg >= 0.5 ? 'text-red-600' : probNeg >= 0.3 ? 'text-amber-500' : 'text-emerald-600'}">${(probNeg * 100).toFixed(0)}%</div>
+            <div class="text-xs text-slate-400 mt-0.5">${mcHorizon} 笔后累计 R &lt; 0 的比例</div>
+          </div>
+          <div class="bg-slate-50 rounded-lg p-3">
+            <div class="text-xs text-slate-500 mb-1">中位数结果</div>
+            <div class="text-2xl font-bold ${mcP50 >= 0 ? 'text-emerald-600' : 'text-red-600'}">${mcP50 >= 0 ? '+' : ''}${mcP50.toFixed(1)}R</div>
+            <div class="text-xs text-slate-400 mt-0.5">一半情形好于此</div>
+          </div>
+          <div class="bg-slate-50 rounded-lg p-3">
+            <div class="text-xs text-slate-500 mb-1">90% 结果区间</div>
+            <div class="text-lg font-bold text-slate-700">${mcP5 >= 0 ? '+' : ''}${mcP5.toFixed(1)} ~ ${mcP95 >= 0 ? '+' : ''}${mcP95.toFixed(1)}R</div>
+            <div class="text-xs text-slate-400 mt-0.5">5% ~ 95% 分位</div>
+          </div>
+          <div class="bg-slate-50 rounded-lg p-3">
+            <div class="text-xs text-slate-500 mb-1">中位最大回撤</div>
+            <div class="text-2xl font-bold text-slate-700">${medDD.toFixed(1)}R</div>
+            <div class="text-xs text-slate-400 mt-0.5">过程中最深的浮亏</div>
+          </div>
+        </div>
+        <div class="flex items-end gap-1 h-20">
+          ${mcBins.map((c, i) => {
+            const center = mcMin + (i + 0.5) * mcSpan / MCB;
+            return `<div class="flex-1 flex flex-col justify-end" title="${center >= 0 ? '+' : ''}${center.toFixed(1)}R 附近：${c} 条"><div class="w-full rounded-t ${center < 0 ? 'bg-red-400' : 'bg-emerald-400'}" style="height:${Math.max(2, c / mcMaxBin * 100)}%"></div></div>`;
+          }).join('')}
+        </div>
+        <p class="text-xs text-slate-400 mt-2">横轴：${mcHorizon} 笔后的累计 R（左亏右盈），纵轴：落入该区间的模拟次数。此为历史分布的重采样推演，不代表未来收益。</p>
       </div>
     </div>`;
     })() : `<div class="bg-white rounded-xl border border-dashed border-slate-300 p-6 text-center">
