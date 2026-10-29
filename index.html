@@ -2433,6 +2433,8 @@ function computeSignalAccuracy() {
 
   // 闭环配对归因：首笔开仓成交 → 最早命中信号（仅买入信号）
   const pairs = computePairs(trades);
+  // 可配置的止损假设（Edgewonk 用户默认 7%，可按需改为 3/5/10%）
+  const RISK_PCT = 0.07;
   for (const c of pairs.closed) {
     const openTradeId = c.buyTradeIds[0];
     const sid = tradeToSig[openTradeId];
@@ -2443,11 +2445,13 @@ function computeSignalAccuracy() {
     grp.closed++;
     grp.pnl += c.pnl;
     if (c.pnl > 0) grp.wins++;
-    // R 倍数：盈亏 ÷ 单笔名义风险（Edgewonk 核心口径；名义风险 = 配对成本 × 7% 止损假设）
-    const risk = Math.abs(c.cost * 0.07);
+    // R 倍数：盈亏 ÷ 名义风险（Edgewonk 核心口径；名义风险 = 配对成本 × 止损假设）
+    const risk = Math.abs(c.cost * RISK_PCT);
     if (risk > 0) {
       const r = c.pnl / risk;
       grp.rSum += r; grp.rN++; grp.rArr.push(r);
+      // 逐笔明细：累计 R 曲线 + tooltip 反查用
+      (grp.rDetails = grp.rDetails || []).push({ r, pnl: c.pnl, symbol: c.symbolName, tradedAt: c.closeAt });
     }
     const sg = gs(s.symbol);
     sg.closed++;
@@ -2456,6 +2460,7 @@ function computeSignalAccuracy() {
     if (risk > 0) {
       const r = c.pnl / risk;
       sg.rSum += r; sg.rN++; sg.rArr.push(r);
+      (sg.rDetails = sg.rDetails || []).push({ r, pnl: c.pnl, symbol: c.symbolName, tradedAt: c.closeAt });
     }
   }
 
@@ -2473,6 +2478,7 @@ function computeSignalAccuracy() {
         const neg = Math.abs(rs.filter(r => r < 0).reduce((s, r) => s + r, 0));
         return neg > 0 ? Math.round((pos / neg) * 100) / 100 : null;
       })() : null,
+      rDetails: x.rDetails || [], // 逐笔 R 明细（累计曲线 + tooltip）
     };
   };
   const rows = Object.values(groups).map(fin).sort((a, b) => b.total - a.total);
@@ -2772,6 +2778,117 @@ function renderSignal(el) {
           </tr>`).join('') : '<tr><td colspan="6" class="px-3 py-6 text-center text-slate-400">无数据</td></tr>'}</tbody></table></div>
       </div>
     </div>` : ''}
+
+    <!-- R 倍数分析：累计曲线 + 分布直方图（基于整体 rDetails） -->
+    ${acc.overall && acc.overall.closed >= 2 ? (() => {
+      // 合并所有平台的 rDetails（按交易时间排序）
+      const allDetails = acc.rows.reduce((s, r) => s.concat(r.rDetails || []), [])
+        .sort((a, b) => a.tradedAt - b.tradedAt);
+      if (!allDetails.length) return '';
+      // ---- 累计 R 曲线 ----
+      let cum = 0; let cumMax = 0; let cumMaxIdx = 0; let cumMin = 0; let cumMinIdx = 0;
+      const cumArr = allDetails.map((d, i) => {
+        cum += d.r;
+        if (cum > cumMax) { cumMax = cum; cumMaxIdx = i; }
+        if (cum < cumMin) { cumMin = cum; cumMinIdx = i; }
+        return cum;
+      });
+      const W = 420, H = 220, pad = { l: 40, r: 15, t: 20, b: 30 };
+      const iw = W - pad.l - pad.r, ih = H - pad.t - pad.b;
+      const yAll = [...cumArr, 0];
+      const yMax = Math.max(...yAll, 1);
+      const yMin = Math.min(...yAll, -1);
+      const yRange = yMax - yMin || 1;
+      const y = v => pad.t + ih - ((v - yMin) / yRange) * ih;
+      const x = i => pad.l + (i / Math.max(cumArr.length - 1, 1)) * iw;
+      // 折线 path + 回撤阴影（从最高点之后的最低点区域）
+      let pathD = `M ${x(0)} ${y(cumArr[0])}`;
+      const pts = cumArr.map((v, i) => { pathD += ` L ${x(i)} ${y(v)}`; return v; });
+      const areaD = pathD + ` L ${x(cumArr.length-1)} ${y(0)} L ${x(0)} ${y(0)} Z`;
+      // 回撤区域（从 cumMaxIdx 到 cumMinIdx）
+      const drawdown = Math.max(0, cumMax - cumMin);
+      // ---- R 分布直方图 ----
+      const buckets = [
+        { label: '≤-2R', min: -Infinity, max: -2 },
+        { label: '-2~-1R', min: -2, max: -1 },
+        { label: '-1~0R', min: -1, max: 0 },
+        { label: '0~1R', min: 0, max: 1 },
+        { label: '1~2R', min: 1, max: 2 },
+        { label: '>2R', min: 2, max: Infinity },
+      ].map(b => ({ ...b, details: [] }));
+      allDetails.forEach(d => { const b = buckets.find(b => d.r > b.min && d.r <= b.max); if (b) b.details.push(d); });
+      const maxCount = Math.max(...buckets.map(b => b.details.length), 1);
+      const BW = 420, BH = 220, Bpad = { l: 40, r: 15, t: 20, b: 40 };
+      const Biw = BW - Bpad.l - Bpad.r, Bih = BH - Bpad.t - Bpad.b;
+      const bw = Biw / buckets.length - 6;
+      // R 神奇数字参考线位置（按 maxAbsR 估算）
+      const maxAbsR = Math.max(2, ...allDetails.map(d => Math.abs(d.r)));
+      return `
+    <div class="grid grid-cols-1 lg:grid-cols-2 gap-4">
+      <!-- 累计 R 曲线 -->
+      <div class="bg-white rounded-xl border border-slate-200 p-5">
+        <div class="flex items-center justify-between mb-3">
+          <h3 class="font-semibold text-sm">累计 R 曲线 <span class="text-xs font-normal text-slate-400">${allDetails.length} 笔已闭环</span></h3>
+          <span class="text-xs text-slate-400">最大回撤 ${Math.abs(cumMax - cumMin).toFixed(2)}R</span>
+        </div>
+        <svg viewBox="0 0 ${W} ${H}" class="w-full h-auto">
+          <!-- 网格线 -->
+          <line x1="${pad.l}" y1="${pad.t}" x2="${pad.l}" y2="${H - pad.b}" stroke="#cbd5e1" stroke-width="1"/>
+          <line x1="${pad.l}" y1="${H - pad.b}" x2="${W - pad.r}" y2="${H - pad.b}" stroke="#cbd5e1" stroke-width="1"/>
+          <!-- 0R 基准线（虚线） -->
+          <line x1="${pad.l}" y1="${y(0)}" x2="${W - pad.r}" y2="${y(0)}" stroke="#94a3b8" stroke-width="1" stroke-dasharray="4,3"/>
+          <!-- 回撤阴影（从最高点到最低点区域） -->
+          ${cumMaxIdx < cumMinIdx ? `
+          <rect x="${x(cumMaxIdx)}" y="${y(cumMax)}" width="${x(cumMinIdx) - x(cumMaxIdx)}" height="${y(cumMin) - y(cumMax)}" fill="#fecaca" fill-opacity="0.4"/>
+          ` : ''}
+          <!-- 累计 R 面积填充 -->
+          <path d="${areaD}" fill="${cumArr[cumArr.length-1] >= 0 ? '#bbf7d0' : '#fecaca'}" fill-opacity="0.5"/>
+          <!-- 折线 -->
+          <path d="${pathD}" fill="none" stroke="${cumArr[cumArr.length-1] >= 0 ? '#16a34a' : '#dc2626'}" stroke-width="2"/>
+          <!-- 0R 基准标签 -->
+          <text x="${pad.l - 6}" y="${y(0) + 4}" text-anchor="end" font-size="10" fill="#64748b" font-weight="500">0R</text>
+          <!-- 最高/最低点标注 -->
+          <circle cx="${x(cumMaxIdx)}" cy="${y(cumMax)}" r="3" fill="#16a34a"/>
+          <circle cx="${x(cumMinIdx)}" cy="${y(cumMin)}" r="3" fill="#dc2626"/>
+          <text x="${x(cumMaxIdx)}" y="${y(cumMax) - 6}" text-anchor="middle" font-size="9" fill="#16a34a">${cumMax.toFixed(2)}R</text>
+          <text x="${x(cumMinIdx)}" y="${y(cumMin) + 12}" text-anchor="middle" font-size="9" fill="#dc2626">${cumMin.toFixed(2)}R</text>
+          <!-- 最大回撤箭头 -->
+          ${drawdown > 0.5 ? `
+          <line x1="${x(cumMaxIdx)}" y1="${y(cumMax)}" x2="${x(cumMinIdx)}" y2="${y(cumMin)}" stroke="#f59e0b" stroke-width="1" stroke-dasharray="2,2"/>
+          <text x="${(x(cumMaxIdx) + x(cumMinIdx))/2}" y="${Math.min(y(cumMax), y(cumMin)) - 6}" text-anchor="middle" font-size="9" fill="#f59e0b">回撤 ${drawdown.toFixed(2)}R</text>
+          ` : ''}
+        </svg>
+        <p class="text-xs text-slate-400 mt-2">资金曲线形态：${cumArr[cumArr.length-1] >= 0 ? '整体正期望' : '整体负期望'}；${cumMax < 0 ? '持续亏损' : cumMin < 0 ? '先亏后盈' : '稳定盈利'}。黄色虚线=最大回撤跨度。</p>
+      </div>
+
+      <!-- R 倍数分布直方图（含 ±1R/±2R 参考线 + bucket 反查） -->
+      <div class="bg-white rounded-xl border border-slate-200 p-5">
+        <h3 class="font-semibold text-sm mb-3">R 倍数分布 <span class="text-xs font-normal text-slate-400">±1R/±2R 为 R 神奇数字</span></h3>
+        <svg viewBox="0 0 ${BW} ${BH}" class="w-full h-auto">
+          <!-- 坐标轴 -->
+          <line x1="${Bpad.l}" y1="${Bpad.t}" x2="${Bpad.l}" y2="${BH - Bpad.b}" stroke="#cbd5e1" stroke-width="1"/>
+          <line x1="${Bpad.l}" y1="${BH - Bpad.b}" x2="${BW - Bpad.r}" y2="${BH - Bpad.b}" stroke="#cbd5e1" stroke-width="1"/>
+          <!-- y 轴刻度 -->
+          ${[0, maxCount/2, maxCount].map((v, i) => `<line x1="${Bpad.l}" y1="${Bpad.t + Bih - (v/maxCount)*Bih}" x2="${BW - Bpad.r}" y2="${Bpad.t + Bih - (v/maxCount)*Bih}" stroke="#f1f5f9" stroke-width="1"/><text x="${Bpad.l - 6}" y="${Bpad.t + Bih - (v/maxCount)*Bih + 4}" text-anchor="end" font-size="10" fill="#94a3b8">${Math.round(v)}</text>`).join('')}
+          <!-- 柱状图 -->
+          ${buckets.map((b, i) => {
+            const count = b.details.length;
+            const h = count ? (count / maxCount) * Bih : 0;
+            const bx = Bpad.l + (i / buckets.length) * Biw + 3;
+            const by = BH - Bpad.b - h;
+            const col = b.max <= 0 ? '#dc2626' : '#16a34a';
+            const tip = b.details.map(d => `${d.symbol} ${d.r.toFixed(2)}R`).join('\n');
+            return `<rect x="${bx}" y="${by}" width="${bw}" height="${h}" fill="${col}" fill-opacity="0.75" rx="3" class="rb-bar" data-b="${i}" style="cursor:pointer"><title>${b.label}: ${count} 笔\n${tip}</title></rect>
+            <text x="${bx + bw/2}" y="${BH - Bpad.b + 14}" text-anchor="middle" font-size="10" fill="#64748b">${b.label}</text>`;
+          }).join('')}
+          <!-- R 神奇数字参考线：在 x 轴下方标注（因为是分桶，参考线放在分桶边界上） -->
+          <text x="${Bpad.l + (buckets.findIndex(b=>b.max===0)/buckets.length)*Biw}" y="${BH - 8}" text-anchor="middle" font-size="10" fill="#f59e0b" font-weight="600">0R</text>
+          <text x="${Bpad.l + (buckets.findIndex(b=>b.max===-1)/buckets.length)*Biw}" y="${BH - 8}" text-anchor="middle" font-size="10" fill="#94a3b8">±1R</text>
+        </svg>
+        <p class="text-xs text-slate-400 mt-2">红柱=亏损区间，绿柱=盈利区间。鼠标悬停查看该桶内标的明细。风险口径：盈亏 ÷ 成本×7% 止损假设。</p>
+      </div>
+    </div>`;
+    })() : ''}
 
     <div class="grid grid-cols-1 lg:grid-cols-2 gap-4">
       <!-- 滑点分布 -->
