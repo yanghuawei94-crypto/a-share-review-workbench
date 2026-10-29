@@ -2785,6 +2785,28 @@ function renderSignal(el) {
       const allDetails = acc.rows.reduce((s, r) => s.concat(r.rDetails || []), [])
         .sort((a, b) => a.tradedAt - b.tradedAt);
       if (!allDetails.length) return '';
+      // ---- R 分布统计量（期望值公式 + 分布形态诊断） ----
+      const rs = allDetails.map(d => d.r);
+      const n = rs.length;
+      const mean = rs.reduce((s, r) => s + r, 0) / n;
+      const variance = rs.reduce((s, r) => s + (r - mean) ** 2, 0) / n;
+      const std = Math.sqrt(variance) || 1;
+      const skewness = rs.reduce((s, r) => s + ((r - mean) / std) ** 3, 0) / n; // 偏度
+      const kurtosis = rs.reduce((s, r) => s + ((r - mean) / std) ** 4, 0) / n - 3; // 超额峰度
+      const winRs = rs.filter(r => r > 0), lossRs = rs.filter(r => r < 0);
+      const winRate = winRs.length / n;
+      const avgWinR = winRs.length ? winRs.reduce((s, r) => s + r, 0) / winRs.length : 0;
+      const avgLossR = lossRs.length ? Math.abs(lossRs.reduce((s, r) => s + r, 0) / lossRs.length) : 0;
+      const expectancyR = winRate * avgWinR - (1 - winRate) * avgLossR; // 期望值公式（R 口径）
+      const lossPct = lossRs.length / n * 100;
+      const bigLossPct = rs.filter(r => r <= -1).length / n * 100; // ≤-1R 大亏损占比
+      // 形态诊断
+      let shapeText = '';
+      if (skewness < -0.5) shapeText = '左偏（亏损尾更厚，大亏拖后腿）';
+      else if (skewness > 0.5) shapeText = '右偏（盈利尾更厚，能拿住大赚）';
+      else shapeText = '近似对称（盈亏分布均衡）';
+      if (kurtosis > 1) shapeText += '；尖峰（极端值较多，波动大）';
+      else if (kurtosis < -1) shapeText += '；平峰（分布分散，无集中区间）';
       // ---- 累计 R 曲线 ----
       const cumArr = []; let cum = 0;
       allDetails.forEach(d => { cum += d.r; cumArr.push(cum); });
@@ -2831,8 +2853,9 @@ function renderSignal(el) {
       <div class="bg-white rounded-xl border border-slate-200 p-5">
         <div class="flex items-center justify-between mb-3">
           <h3 class="font-semibold text-sm">累计 R 曲线 <span class="text-xs font-normal text-slate-400">${allDetails.length} 笔已闭环</span></h3>
-          <span class="text-xs text-slate-400">最大回撤 ${Math.abs(cumMax - cumMin).toFixed(2)}R</span>
+          <span class="text-xs text-slate-400">最大回撤 ${drawdown.toFixed(2)}R</span>
         </div>
+        <p class="text-xs text-slate-500 mb-2">期望值 = 胜率×均盈R − 败率×|均亏R| = ${(winRate*100).toFixed(0)}%×${avgWinR.toFixed(2)}R − ${((1-winRate)*100).toFixed(0)}%×${avgLossR.toFixed(2)}R = <span class="font-semibold ${expectancyR >= 0 ? 'text-red-600' : 'text-green-600'}">${expectancyR >= 0 ? '+' : ''}${expectancyR.toFixed(3)}R/笔</span></p>
         <svg viewBox="0 0 ${W} ${H}" class="w-full h-auto">
           <!-- 网格线 -->
           <line x1="${pad.l}" y1="${pad.t}" x2="${pad.l}" y2="${H - pad.b}" stroke="#cbd5e1" stroke-width="1"/>
@@ -2891,7 +2914,9 @@ function renderSignal(el) {
             const col = b.max <= 0 ? '#dc2626' : '#16a34a';
             const tip = b.details.map(d => `${d.symbol} ${d.r.toFixed(2)}R`).join('\n');
             const detailJson = b.details.length ? esc(JSON.stringify(b.details)) : '';
-            return `<rect x="${bx}" y="${by}" width="${bw}" height="${h}" fill="${col}" fill-opacity="0.75" rx="3" class="rb-bar" data-b="${i}" data-details="${detailJson}" data-label="${b.label}" style="cursor:pointer"><title>${b.label}: ${count} 笔\n${tip}</title></rect>
+            const pct = n ? Math.round(count / n * 100) : 0;
+            return `<rect x="${bx}" y="${by}" width="${bw}" height="${h}" fill="${col}" fill-opacity="0.75" rx="3" class="rb-bar" data-b="${i}" data-details="${detailJson}" data-label="${b.label}" style="cursor:pointer"><title>${b.label}: ${count} 笔 (${pct}%)\n${tip}</title></rect>
+            <text x="${bx + bw/2}" y="${by - 4}" text-anchor="middle" font-size="9" fill="${col}" font-weight="500">${count ? pct + '%' : ''}</text>
             <text x="${bx + bw/2}" y="${BH - Bpad.b + 14}" text-anchor="middle" font-size="10" fill="#64748b">${b.label}</text>`;
           }).join('')}
           <!-- R 神奇数字参考线（-2R/-1R/0R/+1R/+2R 竖线贯穿图表） -->
@@ -2904,7 +2929,8 @@ function renderSignal(el) {
             <text x="${lx}" y="${BH - 8}" text-anchor="middle" font-size="9" fill="${isZero ? '#f59e0b' : '#94a3b8'}" font-weight="${isZero ? '600' : '400'}">${r > 0 ? '+' : ''}${r}R</text>`;
           }).join('')}
         </svg>
-        <p class="text-xs text-slate-400 mt-2">红柱=亏损区间，绿柱=盈利区间。鼠标悬停查看该桶内标的明细。风险口径：盈亏 ÷ 成本×7% 止损假设。</p>
+        <p class="text-xs text-slate-400 mt-2">红柱=亏损区间，绿柱=盈利区间。柱顶百分比=该区间占总交易比例。点击柱子查看标的明细。</p>
+        <p class="text-xs mt-1 ${bigLossPct > 20 ? 'text-red-500' : 'text-slate-500'}">形态：${shapeText}；亏损占比 ${lossPct.toFixed(0)}%，≤-1R 大亏损占比 ${bigLossPct.toFixed(0)}%${bigLossPct > 20 ? '（止损执行不到位）' : ''}</p>
       </div>
     </div>`;
     })() : ''}
