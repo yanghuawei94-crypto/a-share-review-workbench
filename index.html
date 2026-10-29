@@ -2391,6 +2391,8 @@ function setRiskPct(v) {
 
 // R 分析当前选中的信号来源（'all' 或 platform 值）；仅会话内记忆
 let rSrc = 'all';
+// 直方图选中的 R 区间（与累计曲线联动高亮）：{min, max} 或 null
+let hlBucket = null;
 
 function computeSignalAccuracy() {
   const signals = q('SELECT * FROM signals WHERE user_id=$u ORDER BY signaled_at', { $u: LOCAL_USER_ID });
@@ -2909,11 +2911,14 @@ function renderSignal(el) {
           <path d="${areaD}" fill="${cumArr[cumArr.length-1] >= 0 ? '#bbf7d0' : '#fecaca'}" fill-opacity="0.5"/>
           <!-- 折线 -->
           <path d="${pathD}" fill="none" stroke="${cumArr[cumArr.length-1] >= 0 ? '#16a34a' : '#dc2626'}" stroke-width="2"/>
-          <!-- 每笔透明 hover 点（显示 R 值 + 标的 + 平仓时间） -->
-          ${cumArr.map((v, i) => `
-            <circle cx="${x(i)}" cy="${y(v)}" r="6" fill="transparent" style="cursor:pointer">
-              <title>#${i+1} ${allDetails[i].symbol}\nR: ${v>=0?'+':''}${v.toFixed(2)}R · 盈亏 ${allDetails[i].pnl>=0?'+':''}${fmtMoney(allDetails[i].pnl)}\n平仓: ${fmtDateTime(allDetails[i].tradedAt)}</title>
-            </circle>`).join('')}
+          <!-- 每笔 hover 点；直方图聚焦某区间时，同区间点位以实心点高亮 -->
+          ${cumArr.map((v, i) => {
+            const d = allDetails[i];
+            const on = hlBucket && d.r > hlBucket.min && d.r <= hlBucket.max;
+            return `<circle cx="${x(i)}" cy="${y(v)}" r="${on ? 4 : 6}" fill="${on ? '#4f46e5' : 'transparent'}"${on ? ' stroke="#ffffff" stroke-width="1.5"' : ''} style="cursor:pointer">
+              <title>#${i+1} ${d.symbol}\n本笔: ${d.r >= 0 ? '+' : ''}${d.r.toFixed(2)}R · 累计: ${v >= 0 ? '+' : ''}${v.toFixed(2)}R\n盈亏 ${d.pnl >= 0 ? '+' : ''}${fmtMoney(d.pnl)}\n平仓: ${fmtDateTime(d.tradedAt)}</title>
+            </circle>`;
+          }).join('')}
           <!-- 0R 基准标签 -->
           <text x="${pad.l - 6}" y="${y(0) + 4}" text-anchor="end" font-size="11" fill="#64748b" font-weight="500">0R</text>
           <!-- 最高/最低点标注 -->
@@ -2954,7 +2959,7 @@ function renderSignal(el) {
             const tip = b.details.map(d => `${d.symbol} ${d.r.toFixed(2)}R`).join('\n');
             const detailJson = b.details.length ? esc(JSON.stringify(b.details)) : '';
             const pct = n ? Math.round(count / n * 100) : 0;
-            return `<rect x="${bx}" y="${by}" width="${bw}" height="${h}" fill="${col}" fill-opacity="0.75" rx="3" class="rb-bar" data-b="${i}" data-details="${detailJson}" data-label="${b.label}" style="cursor:pointer"><title>${b.label}: ${count} 笔 (${pct}%)\n${tip}</title></rect>
+            return `<rect x="${bx}" y="${by}" width="${bw}" height="${h}" fill="${col}" fill-opacity="${hlBucket && hlBucket.min === b.min && hlBucket.max === b.max ? '1' : '0.75'}" rx="3" class="rb-bar" data-b="${i}" data-details="${detailJson}" data-label="${b.label}" data-min="${b.min}" data-max="${b.max}" style="cursor:pointer"><title>${b.label}: ${count} 笔 (${pct}%)\n${tip}</title></rect>
             <text x="${bx + bw/2}" y="${by - 4}" text-anchor="middle" font-size="11" fill="${col}" font-weight="500">${count ? pct + '%' : ''}</text>
             <text x="${bx + bw/2}" y="${BH - Bpad.b + 14}" text-anchor="middle" font-size="11" fill="#64748b">${b.label}</text>`;
           }).join('')}
@@ -3078,11 +3083,17 @@ function renderSignal(el) {
     };
   });
 
-  // 直方图 bucket 点击 → 弹出该区间内所有标的明细
+  // 直方图 bucket 点击 → 与累计曲线联动高亮（同柱再点取消）+ 弹出该区间明细
   el.querySelectorAll('.rb-bar').forEach(bar => {
     bar.onclick = () => {
       const label = bar.dataset.label || '';
       const raw = bar.dataset.details;
+      const mn = Number(bar.dataset.min), mx = Number(bar.dataset.max);
+      if (raw) {
+        const same = hlBucket && hlBucket.min === mn && hlBucket.max === mx;
+        hlBucket = same ? null : { min: mn, max: mx };
+        renderSignal(el);
+      }
       if (!raw) { openModal({ title: esc(label), bodyHTML: '<p class="text-sm text-slate-500">该区间无数据</p>' }); return; }
       try {
         const details = JSON.parse(raw);
@@ -3096,12 +3107,12 @@ function renderSignal(el) {
 
   // 止损假设切换：改变所有 R 值的分母，切换后整页重算重渲染
   el.querySelectorAll('[data-risk]').forEach(btn => {
-    btn.onclick = () => { setRiskPct(btn.dataset.risk); renderSignal(el); };
+    btn.onclick = () => { setRiskPct(btn.dataset.risk); hlBucket = null; renderSignal(el); };
   });
 
   // 信号来源切换：只看某个来源的 R 分布与累计曲线
   el.querySelectorAll('[data-rsrc]').forEach(btn => {
-    btn.onclick = () => { rSrc = btn.dataset.rsrc; renderSignal(el); };
+    btn.onclick = () => { rSrc = btn.dataset.rsrc; hlBucket = null; renderSignal(el); };
   });
 }
 
