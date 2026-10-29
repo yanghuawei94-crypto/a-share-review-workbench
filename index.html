@@ -1359,6 +1359,11 @@ const STD_FIELDS = [
 // 交割单方向只做精确匹配（脏数据直接拒绝）；宽松兜底归一化见 db.js normDirection（信号导入专用）
 const DIRECTION_MAP = DIR_MAP;
 
+// 免费版自定义模板额度：仅保留 1 个（见 Phase2_会员支付方案.md §2）
+// 会员标识（/api/me + users.plan_tier）接入后，这里改为「会员不限、免费 1 个」的判定
+const FREE_CUSTOM_TPL_LIMIT = 1;
+const customTemplates = () => q('SELECT * FROM broker_templates WHERE is_builtin=0 ORDER BY created_at');
+
 // ---------- 编码兼容：UTF-8 严格解码失败则 GBK 兜底（券商导出常见 GBK） ----------
 function decodeBuffer(buf) {
   try { return new TextDecoder('utf-8', { fatal: true }).decode(buf); }
@@ -1384,6 +1389,8 @@ function renderImport(el) {
   const templates = q('SELECT * FROM broker_templates ORDER BY is_builtin DESC, created_at');
   const batches = q('SELECT b.*, t.broker_name FROM import_batches b LEFT JOIN broker_templates t ON t.id=b.template_id WHERE b.user_id=$u ORDER BY b.created_at DESC', { $u: LOCAL_USER_ID });
   const tradeCount = q1('SELECT COUNT(*) c FROM trades WHERE user_id=$u', { $u: LOCAL_USER_ID }).c;
+  // 免费版额度展示：自定义模板 n/1（内置模板不占配额）
+  const myTplCount = templates.filter(t => !t.is_builtin).length;
 
   el.innerHTML = `
   <div class="p-6 space-y-6">
@@ -1404,7 +1411,7 @@ function renderImport(el) {
         <p class="text-xs text-indigo-200 mt-2">当前账本已有 ${tradeCount} 笔成交</p>
       </div>
       <div class="bg-white rounded-xl border border-slate-200 p-5">
-        <h3 class="font-semibold mb-2">模板库（${templates.length}）</h3>
+        <h3 class="font-semibold mb-2">模板库（内置 ${templates.length - myTplCount} · 自定义 ${myTplCount}/${FREE_CUSTOM_TPL_LIMIT}）</h3>
         <ul class="text-sm space-y-1.5 max-h-36 overflow-y-auto">
           ${templates.map(t => `<li class="flex items-center gap-2">
             <span class="text-xs px-1.5 py-0.5 rounded ${t.is_builtin ? 'bg-emerald-50 text-emerald-600' : 'bg-amber-50 text-amber-600'}">${t.is_builtin ? '内置' : '自定义'}</span>
@@ -1489,6 +1496,7 @@ function subsetMatchTemplate(headers) {
 // 通用 CSV 映射工具（US-03）：前 5 行预览 + 列->标准字段下拉
 function renderMapper(el, ctx) {
   const { headers, dataRows } = ctx;
+  const customCount = customTemplates().length; // 免费版已占用的自定义模板数
   const area = el.querySelector('#mapper-area');
   area.innerHTML = `
   <div class="bg-white rounded-xl border-2 border-indigo-200 p-5 space-y-4">
@@ -1505,7 +1513,9 @@ function renderMapper(el, ctx) {
     </table></div>
     <div class="flex flex-wrap items-center gap-3">
       <label class="text-sm text-slate-600">模板名（券商/来源）<input id="tpl-name" class="ml-1 border rounded-lg px-2 py-1.5 text-sm" placeholder="如：QMT客户端导出"></label>
-      <label class="text-sm text-slate-600 flex items-center gap-1"><input id="tpl-save" type="checkbox" checked> 保存为自定义模板</label>
+      <label class="text-sm text-slate-600 flex items-center gap-1"><input id="tpl-save" type="checkbox" checked> 保存为自定义模板
+        <span class="text-xs ${customCount ? 'text-amber-600' : 'text-slate-400'}">免费版 ${customCount}/${FREE_CUSTOM_TPL_LIMIT}${customCount ? '，再保存将覆盖旧模板' : ''}</span>
+      </label>
       <button id="do-import" class="px-4 py-2 bg-indigo-600 text-white rounded-lg text-sm hover:bg-indigo-700">确认映射并导入</button>
       <button id="cancel-import" class="px-4 py-2 bg-slate-100 rounded-lg text-sm hover:bg-slate-200">取消</button>
     </div>
@@ -1530,16 +1540,53 @@ function renderMapper(el, ctx) {
     let templateId = null, templateName = '未保存模板';
     if (area.querySelector('#tpl-save').checked) {
       const name = area.querySelector('#tpl-name').value.trim() || '自定义模板';
-      templateId = uuid(); templateName = name;
-      run(`INSERT INTO broker_templates (id, broker_name, source_type, version, column_mapping, parse_rules, is_builtin, sample_hash, created_at)
-           VALUES ($id, $n, 'csv', 1, $m, $p, 0, $h, $ts)`, {
-        $id: templateId, $n: name, $m: JSON.stringify(mapping),
-        $p: JSON.stringify({ direction_map: DIRECTION_MAP }),
-        $h: simpleHash(headers.join(',')), $ts: now(),
-      });
+      const mappingJson = JSON.stringify(mapping);
+      const sampleHash = simpleHash(headers.join(','));
+      const mine = customTemplates(); // 已占用的自定义模板（内置模板不占配额）
+      const prev = mine.length >= FREE_CUSTOM_TPL_LIMIT ? mine[0] : null; // 覆盖最早创建的那个
+
+      // 模板名唯一索引校验（broker_name + source_type + version），避免直接抛约束错误中断导入
+      const dup = q1(`SELECT id, is_builtin FROM broker_templates WHERE broker_name=$n AND source_type='csv' AND version=1`, { $n: name });
+      if (dup && (!prev || dup.id !== prev.id)) {
+        alert(`模板名「${name}」已被${dup.is_builtin ? '内置' : '其他自定义'}模板占用，请换一个名称。`);
+        return;
+      }
+
+      if (prev) {
+        const okOverwrite = confirm(
+          `免费版仅保留 ${FREE_CUSTOM_TPL_LIMIT} 个自定义模板，当前已用 ${mine.length}/${FREE_CUSTOM_TPL_LIMIT}。\n\n` +
+          `保存「${name}」将覆盖「${prev.broker_name}」。\n` +
+          `被覆盖模板的列名与映射会记入模板备注，升级会员后可据此恢复。\n\n` +
+          `继续导入并覆盖？`
+        );
+        if (okOverwrite) {
+          // 原地 UPDATE 而非删除重建：import_batches.template_id 归属不变，历史批次不会失去模板名
+          templateId = prev.id; templateName = name;
+          let prevMapping = null;
+          try { prevMapping = JSON.parse(prev.column_mapping); } catch (e) { prevMapping = null; }
+          run(`UPDATE broker_templates
+                  SET broker_name=$n, version=1, column_mapping=$m, sample_hash=$h, parse_rules=$p, created_at=$ts
+                WHERE id=$id`, {
+            $n: name, $m: mappingJson, $h: sampleHash, $ts: now(), $id: prev.id,
+            $p: JSON.stringify({
+              direction_map: DIRECTION_MAP,
+              // 被覆盖模板的留存信息（升级恢复用），不参与任何解析逻辑
+              overwritten_prev: prevMapping ? { broker_name: prev.broker_name, column_mapping: prevMapping } : { broker_name: prev.broker_name },
+            }),
+          });
+        }
+        // 取消覆盖：跳过模板保存，导入照常完成（额度提示不阻断数据入库）
+      } else {
+        templateId = uuid(); templateName = name;
+        run(`INSERT INTO broker_templates (id, broker_name, source_type, version, column_mapping, parse_rules, is_builtin, sample_hash, created_at)
+             VALUES ($id, $n, 'csv', 1, $m, $p, 0, $h, $ts)`, {
+          $id: templateId, $n: name, $m: mappingJson,
+          $p: JSON.stringify({ direction_map: DIRECTION_MAP }),
+          $h: sampleHash, $ts: now(),
+        });
+      }
     }
-    doImport({ el, file: ctx.file, fileHash: ctx.fileHash, rows: ctx.dataRows, headers, mapping, templateId, templateName });
-    area.innerHTML = '';
+    doImport({ el, file: ctx.file, fileHash: ctx.fileHash, rows: ctx.dataRows, headers, mapping, templateId, templateName }); // 内部已重新渲染（模板库计数随之刷新）
   };
 }
 
