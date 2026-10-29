@@ -1876,19 +1876,19 @@ function renderDashboard(el) {
           const labelY = [1, 0, -1].map(f => {
             const gy = pad.t + ih / 2 - (f * 0.9) * ih / 2;
             const v = Math.round(maxAbsPnl * f * 0.9);
-            return `<text x="${pad.l - 6}" y="${gy + 4}" text-anchor="end" font-size="10" fill="#94a3b8">${fmtMoney(v)}</text>`;
+            return `<text x="${pad.l - 6}" y="${gy + 4}" text-anchor="end" font-size="11" fill="#94a3b8">${fmtMoney(v)}</text>`;
           }).join('');
-          return `<svg viewBox="0 0 ${W} ${H}" class="w-full h-auto">
+          return `<div class="overflow-x-auto -mx-1 px-1"><svg viewBox="0 0 ${W} ${H}" class="h-auto w-full" style="min-width:400px">
             <line x1="${pad.l}" y1="${pad.t}" x2="${pad.l}" y2="${H - pad.b}" stroke="#cbd5e1" stroke-width="1"/>
             <line x1="${pad.l}" y1="${H - pad.b}" x2="${W - pad.r}" y2="${H - pad.b}" stroke="#cbd5e1" stroke-width="1"/>
             <line x1="${pad.l}" y1="${pad.t + ih / 2}" x2="${W - pad.r}" y2="${pad.t + ih / 2}" stroke="#cbd5e1" stroke-width="1" stroke-dasharray="4,3"/>
             ${gridY}
             ${labelY}
-            <text x="${pad.l - 6}" y="${pad.t + ih / 2 + 4}" text-anchor="end" font-size="10" fill="#64748b" font-weight="500">0</text>
-            <text x="${(pad.l + W - pad.r) / 2}" y="${H - 6}" text-anchor="middle" font-size="10" fill="#94a3b8">持仓天数</text>
-            <text x="${pad.l - 30}" y="${pad.t + 8}" font-size="10" fill="#94a3b8" transform="rotate(-90 ${pad.l - 30} ${pad.t + 8})" text-anchor="end">盈亏</text>
+            <text x="${pad.l - 6}" y="${pad.t + ih / 2 + 4}" text-anchor="end" font-size="11" fill="#64748b" font-weight="500">0</text>
+            <text x="${(pad.l + W - pad.r) / 2}" y="${H - 6}" text-anchor="middle" font-size="11" fill="#94a3b8">持仓天数</text>
+            <text x="${pad.l - 30}" y="${pad.t + 8}" font-size="11" fill="#94a3b8" transform="rotate(-90 ${pad.l - 30} ${pad.t + 8})" text-anchor="end">盈亏</text>
             ${pts}
-          </svg>`;
+          </svg></div>`;
         })()}
         <p class="text-xs text-slate-400 mt-2">右上=拿得住且赚；右下=拿得住但亏；左上=短炒赚钱；左下=短炒亏钱。点击点可溯源。</p>
       </div>
@@ -2886,7 +2886,7 @@ function renderSignal(el) {
           <span class="text-xs text-slate-400">最大回撤 ${drawdown.toFixed(2)}R</span>
         </div>
         <p class="text-xs text-slate-500 mb-2">期望值 = 胜率×均盈R − 败率×|均亏R| = ${(winRate*100).toFixed(0)}%×${avgWinR.toFixed(2)}R − ${((1-winRate)*100).toFixed(0)}%×${avgLossR.toFixed(2)}R = <span class="font-semibold ${expectancyR >= 0 ? 'text-red-600' : 'text-green-600'}">${expectancyR >= 0 ? '+' : ''}${expectancyR.toFixed(3)}R/笔</span></p>
-        <svg viewBox="0 0 ${W} ${H}" class="w-full h-auto">
+        <div class="overflow-x-auto -mx-1 px-1"><svg viewBox="0 0 ${W} ${H}" class="h-auto w-full" style="min-width:400px">
           <!-- 网格线 -->
           <line x1="${pad.l}" y1="${pad.t}" x2="${pad.l}" y2="${H - pad.b}" stroke="#cbd5e1" stroke-width="1"/>
           <line x1="${pad.l}" y1="${H - pad.b}" x2="${W - pad.r}" y2="${H - pad.b}" stroke="#cbd5e1" stroke-width="1"/>
@@ -2906,25 +2906,25 @@ function renderSignal(el) {
               <title>#${i+1} ${allDetails[i].symbol}\nR: ${v>=0?'+':''}${v.toFixed(2)}R · 盈亏 ${allDetails[i].pnl>=0?'+':''}${fmtMoney(allDetails[i].pnl)}\n平仓: ${fmtDateTime(allDetails[i].tradedAt)}</title>
             </circle>`).join('')}
           <!-- 0R 基准标签 -->
-          <text x="${pad.l - 6}" y="${y(0) + 4}" text-anchor="end" font-size="10" fill="#64748b" font-weight="500">0R</text>
+          <text x="${pad.l - 6}" y="${y(0) + 4}" text-anchor="end" font-size="11" fill="#64748b" font-weight="500">0R</text>
           <!-- 最高/最低点标注 -->
           <circle cx="${x(cumMaxIdx)}" cy="${y(cumMax)}" r="3" fill="#16a34a"/>
           <circle cx="${x(cumMinIdx)}" cy="${y(cumMin)}" r="3" fill="#dc2626"/>
-          <text x="${x(cumMaxIdx)}" y="${y(cumMax) - 6}" text-anchor="middle" font-size="9" fill="#16a34a">${cumMax.toFixed(2)}R</text>
-          <text x="${x(cumMinIdx)}" y="${y(cumMin) + 12}" text-anchor="middle" font-size="9" fill="#dc2626">${cumMin.toFixed(2)}R</text>
+          <text x="${x(cumMaxIdx)}" y="${y(cumMax) - 6}" text-anchor="middle" font-size="11" fill="#16a34a">${cumMax.toFixed(2)}R</text>
+          <text x="${x(cumMinIdx)}" y="${y(cumMin) + 12}" text-anchor="middle" font-size="11" fill="#dc2626">${cumMin.toFixed(2)}R</text>
           <!-- 最大回撤箭头 -->
           ${drawdown > 0.5 ? `
           <line x1="${x(cumMaxIdx)}" y1="${y(cumMax)}" x2="${x(cumMinIdx)}" y2="${y(cumMin)}" stroke="#f59e0b" stroke-width="1" stroke-dasharray="2,2"/>
-          <text x="${(x(cumMaxIdx) + x(cumMinIdx))/2}" y="${Math.min(y(cumMax), y(cumMin)) - 6}" text-anchor="middle" font-size="9" fill="#f59e0b">回撤 ${drawdown.toFixed(2)}R</text>
+          <text x="${(x(cumMaxIdx) + x(cumMinIdx))/2}" y="${Math.min(y(cumMax), y(cumMin)) - 6}" text-anchor="middle" font-size="11" fill="#f59e0b">回撤 ${drawdown.toFixed(2)}R</text>
           ` : ''}
-        </svg>
+        </svg></div>
         <p class="text-xs text-slate-400 mt-2">资金曲线形态：${cumArr[cumArr.length-1] >= 0 ? '整体正期望' : '整体负期望'}；${cumMax < 0 ? '持续亏损' : cumMin < 0 ? '先亏后盈' : '稳定盈利'}。黄色虚线=最大回撤跨度。</p>
       </div>
 
       <!-- R 倍数分布直方图（含 ±1R/±2R 参考线 + bucket 反查） -->
       <div class="bg-white rounded-xl border border-slate-200 p-5">
         <h3 class="font-semibold text-sm mb-3">R 倍数分布 <span class="text-xs font-normal text-slate-400">±1R/±2R 为 R 神奇数字</span></h3>
-        <svg viewBox="0 0 ${BW} ${BH}" class="w-full h-auto">
+        <div class="overflow-x-auto -mx-1 px-1"><svg viewBox="0 0 ${BW} ${BH}" class="h-auto w-full" style="min-width:400px">
           <!-- 坐标轴 -->
           <line x1="${Bpad.l}" y1="${Bpad.t}" x2="${Bpad.l}" y2="${BH - Bpad.b}" stroke="#cbd5e1" stroke-width="1"/>
           <line x1="${Bpad.l}" y1="${BH - Bpad.b}" x2="${BW - Bpad.r}" y2="${BH - Bpad.b}" stroke="#cbd5e1" stroke-width="1"/>
@@ -2933,7 +2933,7 @@ function renderSignal(el) {
             const step = maxCount <= 5 ? 1 : Math.ceil(maxCount / 5);
             const v = i * step;
             if (v > maxCount) return '';
-            return `<line x1="${Bpad.l}" y1="${Bpad.t + Bih - (v/maxCount)*Bih}" x2="${BW - Bpad.r}" y2="${Bpad.t + Bih - (v/maxCount)*Bih}" stroke="#f1f5f9" stroke-width="1"/><text x="${Bpad.l - 6}" y="${Bpad.t + Bih - (v/maxCount)*Bih + 4}" text-anchor="end" font-size="10" fill="#94a3b8">${v}</text>`;
+            return `<line x1="${Bpad.l}" y1="${Bpad.t + Bih - (v/maxCount)*Bih}" x2="${BW - Bpad.r}" y2="${Bpad.t + Bih - (v/maxCount)*Bih}" stroke="#f1f5f9" stroke-width="1"/><text x="${Bpad.l - 6}" y="${Bpad.t + Bih - (v/maxCount)*Bih + 4}" text-anchor="end" font-size="11" fill="#94a3b8">${v}</text>`;
           }).join('')}
           <!-- 柱状图 -->
           ${buckets.map((b, i) => {
@@ -2946,8 +2946,8 @@ function renderSignal(el) {
             const detailJson = b.details.length ? esc(JSON.stringify(b.details)) : '';
             const pct = n ? Math.round(count / n * 100) : 0;
             return `<rect x="${bx}" y="${by}" width="${bw}" height="${h}" fill="${col}" fill-opacity="0.75" rx="3" class="rb-bar" data-b="${i}" data-details="${detailJson}" data-label="${b.label}" style="cursor:pointer"><title>${b.label}: ${count} 笔 (${pct}%)\n${tip}</title></rect>
-            <text x="${bx + bw/2}" y="${by - 4}" text-anchor="middle" font-size="9" fill="${col}" font-weight="500">${count ? pct + '%' : ''}</text>
-            <text x="${bx + bw/2}" y="${BH - Bpad.b + 14}" text-anchor="middle" font-size="10" fill="#64748b">${b.label}</text>`;
+            <text x="${bx + bw/2}" y="${by - 4}" text-anchor="middle" font-size="11" fill="${col}" font-weight="500">${count ? pct + '%' : ''}</text>
+            <text x="${bx + bw/2}" y="${BH - Bpad.b + 14}" text-anchor="middle" font-size="11" fill="#64748b">${b.label}</text>`;
           }).join('')}
           <!-- R 神奇数字参考线（-2R/-1R/0R/+1R/+2R 竖线贯穿图表） -->
           ${[-2, -1, 0, 1, 2].map(r => {
@@ -2956,9 +2956,9 @@ function renderSignal(el) {
             const lx = Bpad.l + (idx / buckets.length) * Biw;
             const isZero = r === 0;
             return `<line x1="${lx}" y1="${Bpad.t}" x2="${lx}" y2="${BH - Bpad.b}" stroke="${isZero ? '#f59e0b' : '#e2e8f0'}" stroke-width="${isZero ? 1.5 : 1}" stroke-dasharray="${isZero ? '4,3' : '2,4'}"/>
-            <text x="${lx}" y="${BH - 8}" text-anchor="middle" font-size="9" fill="${isZero ? '#f59e0b' : '#94a3b8'}" font-weight="${isZero ? '600' : '400'}">${r > 0 ? '+' : ''}${r}R</text>`;
+            <text x="${lx}" y="${BH - 8}" text-anchor="middle" font-size="11" fill="${isZero ? '#f59e0b' : '#94a3b8'}" font-weight="${isZero ? '600' : '400'}">${r > 0 ? '+' : ''}${r}R</text>`;
           }).join('')}
-        </svg>
+        </svg></div>
         <p class="text-xs text-slate-400 mt-2">红柱=亏损区间，绿柱=盈利区间。柱顶百分比=该区间占总交易比例。点击柱子查看标的明细。</p>
         <p class="text-xs mt-1 ${bigLossPct > 20 ? 'text-red-500' : 'text-slate-500'}">形态：${shapeText}；亏损占比 ${lossPct.toFixed(0)}%，≤-1R 大亏损占比 ${bigLossPct.toFixed(0)}%${bigLossPct > 20 ? '（止损执行不到位）' : ''}</p>
       </div>
