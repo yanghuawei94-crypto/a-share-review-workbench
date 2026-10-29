@@ -1894,6 +1894,56 @@ function renderDashboard(el) {
       </div>
     </div>
 
+    <div class="grid grid-cols-1 gap-4">
+      <!-- 时段 × 星期 归因热力图 -->
+      <div class="bg-white rounded-xl border border-slate-200 p-5">
+        <h3 class="font-semibold text-sm mb-1">建仓时段 × 星期 归因 <span class="text-xs font-normal text-slate-400">什么时间下的单最容易亏</span></h3>
+        <p class="text-xs text-slate-400 mb-3">按建仓（买入）时间落位，非平仓时间。红=合计盈利，绿=合计亏损，颜色越深金额越大；格内为笔数。</p>
+        ${(() => {
+          // 归因口径：以每个完整交易的「首笔买入时间」定位时段与星期
+          const tMap = new Map(trades.map(t => [t.id, t]));
+          const slots = [
+            ['09:30-10:00', 570, 600], ['10:00-11:30', 600, 690],
+            ['13:00-14:00', 780, 840], ['14:00-14:50', 840, 890], ['14:50-15:00', 890, 900],
+          ];
+          const days = ['周一', '周二', '周三', '周四', '周五'];
+          const grid = slots.map(() => days.map(() => ({ pnl: 0, n: 0 })));
+          let unplaced = 0;
+          for (const c of closed) {
+            const bt = tMap.get((c.buyTradeIds || [])[0]);
+            if (!bt) { unplaced++; continue; }
+            const d = new Date(bt.traded_at * 1000);
+            const wd = d.getDay() - 1;           // 周一=0
+            if (wd < 0 || wd > 4) { unplaced++; continue; }
+            const mm = d.getHours() * 60 + d.getMinutes();
+            const si = slots.findIndex(s => mm >= s[1] && mm < s[2]);
+            if (si < 0) { unplaced++; continue; }
+            grid[si][wd].pnl += c.pnl;
+            grid[si][wd].n++;
+          }
+          const maxAbs = Math.max(1, ...grid.flat().map(x => Math.abs(x.pnl)));
+          const cell = (v, n, si, di) => {
+            if (!n) return `<div class="h-10 rounded bg-slate-50" data-si="${si}" data-di="${di}"></div>`;
+            const a = Math.min(0.85, Math.abs(v) / maxAbs * 0.85);
+            const bg = v >= 0 ? `rgba(220,38,38,${a.toFixed(2)})` : `rgba(22,163,74,${a.toFixed(2)})`;
+            return `<div class="h-10 rounded flex flex-col items-center justify-center leading-tight" data-si="${si}" data-di="${di}" style="background:${bg}" title="${slots[si][0]} ${days[di]} · ${n} 笔 · 合计 ${v >= 0 ? '+' : ''}${fmtMoney(v)}">
+              <span class="text-xs font-medium ${a > 0.5 ? 'text-white' : (v >= 0 ? 'text-red-600' : 'text-green-600')}">${v >= 0 ? '+' : ''}${Math.round(v)}</span>
+              <span class="text-xs ${a > 0.5 ? 'text-white/80' : 'text-slate-400'}">${n}笔</span>
+            </div>`;
+          };
+          const totals = slots.map((s, si) => grid[si].reduce((acc, x) => ({ pnl: acc.pnl + x.pnl, n: acc.n + x.n }), { pnl: 0, n: 0 }));
+          return `<div class="grid" style="grid-template-columns:72px repeat(5,minmax(0,1fr)) 58px;gap:4px">
+            <div></div>${days.map(d => `<div class="text-xs text-slate-400 text-center pb-1">${d}</div>`).join('')}<div class="text-xs text-slate-400 text-center pb-1">合计</div>
+            ${slots.map((s, si) => `
+              <div class="text-xs text-slate-500 flex items-center">${s[0]}</div>
+              ${days.map((d, di) => cell(grid[si][di].pnl, grid[si][di].n, si, di)).join('')}
+              <div class="text-xs text-center flex items-center justify-center font-medium ${totals[si].pnl >= 0 ? 'text-red-600' : 'text-green-600'}">${totals[si].n ? (totals[si].pnl >= 0 ? '+' : '') + Math.round(totals[si].pnl) : '-'}</div>`).join('')}
+          </div>
+          ${unplaced ? `<p class="text-xs text-slate-400 mt-2">另有 ${unplaced} 笔未落入交易时段（如集合竞价或数据缺失）。</p>` : ''}`;
+        })()}
+      </div>
+    </div>
+
     <div class="grid grid-cols-1 lg:grid-cols-2 gap-4">
       <!-- 个股盈亏排名 -->
       <div class="bg-white rounded-xl border border-slate-200 p-5">
