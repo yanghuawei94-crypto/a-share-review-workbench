@@ -2878,7 +2878,8 @@ function renderSignal(el) {
             const by = BH - Bpad.b - h;
             const col = b.max <= 0 ? '#dc2626' : '#16a34a';
             const tip = b.details.map(d => `${d.symbol} ${d.r.toFixed(2)}R`).join('\n');
-            return `<rect x="${bx}" y="${by}" width="${bw}" height="${h}" fill="${col}" fill-opacity="0.75" rx="3" class="rb-bar" data-b="${i}" style="cursor:pointer"><title>${b.label}: ${count} 笔\n${tip}</title></rect>
+            const detailJson = b.details.length ? esc(JSON.stringify(b.details)) : '';
+            return `<rect x="${bx}" y="${by}" width="${bw}" height="${h}" fill="${col}" fill-opacity="0.75" rx="3" class="rb-bar" data-b="${i}" data-details="${detailJson}" data-label="${b.label}" style="cursor:pointer"><title>${b.label}: ${count} 笔\n${tip}</title></rect>
             <text x="${bx + bw/2}" y="${BH - Bpad.b + 14}" text-anchor="middle" font-size="10" fill="#64748b">${b.label}</text>`;
           }).join('')}
           <!-- R 神奇数字参考线：在 x 轴下方标注（因为是分桶，参考线放在分桶边界上） -->
@@ -2988,6 +2989,22 @@ function renderSignal(el) {
       else if (key === 'extra') { title = '无信号成交明细';
         body = `<p class="text-sm text-slate-500 mb-2">以下 ${attr.extraCount} 笔成交不在任何信号的 ±3600s 窗口内，属于信号外交易</p>`; }
       openModal({ title: esc(title), bodyHTML: body });
+    };
+  });
+
+  // 直方图 bucket 点击 → 弹出该区间内所有标的明细
+  el.querySelectorAll('.rb-bar').forEach(bar => {
+    bar.onclick = () => {
+      const label = bar.dataset.label || '';
+      const raw = bar.dataset.details;
+      if (!raw) { openModal({ title: esc(label), bodyHTML: '<p class="text-sm text-slate-500">该区间无数据</p>' }); return; }
+      try {
+        const details = JSON.parse(raw);
+        const body = `<p class="text-sm text-slate-500 mb-3">共 ${details.length} 笔（R 倍数区间 ${esc(label)}）</p>
+          <table class="min-w-full text-sm"><thead class="bg-slate-50 text-xs"><tr>${['标的','R 倍数','盈亏','平仓时间'].map(h=>`<th class="px-3 py-2 text-left">${h}</th>`).join('')}</tr></thead><tbody>
+          ${details.map(d=>`<tr class="border-t"><td class="px-3 py-2">${esc(d.symbol)}</td><td class="px-3 py-2 font-mono font-medium ${d.r>=0?'text-red-600':'text-green-600'}">${d.r>=0?'+':''}${d.r.toFixed(2)}R</td><td class="px-3 py-2 text-right font-mono ${d.pnl>=0?'text-red-600':'text-green-600'}">${d.pnl>=0?'+':''}${fmtMoney(d.pnl)}</td><td class="px-3 py-2 text-xs text-slate-500">${fmtDateTime(d.tradedAt)}</td></tr>`).join('')}</tbody></table>`;
+        openModal({ title: esc(label) + ' · ' + details.length + ' 笔', bodyHTML: body });
+      } catch (e) { openModal({ title: esc(label), bodyHTML: '<p class="text-sm text-red-500">数据解析失败</p>' }); }
     };
   });
 }
