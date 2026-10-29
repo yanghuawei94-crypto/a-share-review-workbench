@@ -2377,6 +2377,18 @@ function computeAttribution() {
 // 合规：本统计是对历史跟单结果的事后核对，不构成对任何信号来源的推荐或评价。
 const PLATFORM_LABEL = { joinquant: '聚宽', qmt: 'QMT', csv: 'CSV 导入', mock: '模拟', other: '其他' };
 
+// R 倍数口径：名义风险 = 持仓成本 × 止损假设。止损比例必须让用户可见可调，
+// 否则所有 R 值都建立在一个隐藏的 7% 前提上（违反「指标可溯源」）。
+const RISK_KEY = 'trae_risk_pct_v1';
+const RISK_OPTIONS = [0.03, 0.05, 0.07, 0.1];
+function getRiskPct() {
+  const v = Number(localStorage.getItem(RISK_KEY));
+  return RISK_OPTIONS.includes(v) ? v : 0.07;
+}
+function setRiskPct(v) {
+  if (RISK_OPTIONS.includes(Number(v))) localStorage.setItem(RISK_KEY, String(Number(v)));
+}
+
 function computeSignalAccuracy() {
   const signals = q('SELECT * FROM signals WHERE user_id=$u ORDER BY signaled_at', { $u: LOCAL_USER_ID });
   if (!signals.length) return null;
@@ -2433,8 +2445,8 @@ function computeSignalAccuracy() {
 
   // 闭环配对归因：首笔开仓成交 → 最早命中信号（仅买入信号）
   const pairs = computePairs(trades);
-  // 可配置的止损假设（Edgewonk 用户默认 7%，可按需改为 3/5/10%）
-  const RISK_PCT = 0.07;
+  // 用户可调的止损假设（默认 7%），决定所有 R 值的分母
+  const RISK_PCT = getRiskPct();
   for (const c of pairs.closed) {
     const openTradeId = c.buyTradeIds[0];
     const sid = tradeToSig[openTradeId];
@@ -2738,10 +2750,13 @@ function renderSignal(el) {
         <h3 class="font-semibold text-sm">信号准确率统计（跟单盈亏）</h3>
         <span class="text-xs px-2 py-0.5 rounded bg-indigo-50 text-indigo-600">整体胜率 ${acc.overall.winRate !== null ? fmtPct(acc.overall.winRate) : '—'}</span>
         <span class="text-xs px-2 py-0.5 rounded ${acc.overall.pnl >= 0 ? 'bg-red-50 text-red-600' : 'bg-green-50 text-green-600'}">跟单盈亏 ${acc.overall.pnl >= 0 ? '+' : ''}${fmtMoney(acc.overall.pnl)}</span>
+        <span class="ml-auto flex items-center gap-1 text-xs text-slate-500">止损假设
+          ${RISK_OPTIONS.map(v => `<button data-risk="${v}" class="px-2 py-0.5 rounded border ${getRiskPct() === v ? 'bg-indigo-600 text-white border-indigo-600' : 'bg-white border-slate-300 text-slate-600 hover:bg-slate-50'}">${(v * 100).toFixed(0)}%</button>`).join('')}
+        </span>
       </div>
       <p class="text-xs text-slate-400 mb-3 leading-relaxed">
         口径：闭环配对的「首笔开仓成交」被信号匹配即归属（多信号命中同一笔只计最早一条）；仅买入信号参与盈亏归因，卖出信号只统计执行/漏跟；未闭环持仓不计入胜率。
-        R 倍数 = 配对盈亏 ÷ 名义风险（成本 × 7% 止损假设），期望值 = 总盈亏 ÷ 已闭环笔数，盈亏比 = 总盈利 ÷ |总亏损|（均基于 R）。
+        R 倍数 = 配对盈亏 ÷ 名义风险（成本 × ${(getRiskPct() * 100).toFixed(0)}% 止损假设，可在右上角切换），期望值 = 总盈亏 ÷ 已闭环笔数，盈亏比 = 总盈利 ÷ |总亏损|（均基于 R）。
         本统计是对历史跟单结果的事后核对，<span class="text-slate-500">历史表现不代表未来，不构成对任何信号来源的推荐或评价</span>。
       </p>
       ${acc.overall.executed === 0 ? `<div class="mb-3 text-xs bg-amber-50 border border-amber-200 text-amber-700 rounded-lg px-3 py-2 leading-relaxed">
@@ -2941,7 +2956,7 @@ function renderSignal(el) {
     </div>`;
     })() : `<div class="bg-white rounded-xl border border-dashed border-slate-300 p-6 text-center">
       <div class="text-sm font-medium text-slate-600 mb-1">R 倍数分析待解锁</div>
-      <p class="text-xs text-slate-400 leading-relaxed">需要至少 2 笔已闭环交易（买入后有对应卖出）。当前 ${acc.overall ? acc.overall.closed : 0} 笔。<br>R = 配对盈亏 ÷ (持仓成本 × 7% 止损假设)。</p>
+      <p class="text-xs text-slate-400 leading-relaxed">需要至少 2 笔已闭环交易（买入后有对应卖出）。当前 ${acc.overall ? acc.overall.closed : 0} 笔。<br>R = 配对盈亏 ÷ (持仓成本 × ${(getRiskPct() * 100).toFixed(0)}% 止损假设)。</p>
     </div>`}
 
     <div class="grid grid-cols-1 lg:grid-cols-2 gap-4">
@@ -3059,6 +3074,11 @@ function renderSignal(el) {
         openModal({ title: esc(label) + ' · ' + details.length + ' 笔', bodyHTML: body });
       } catch (e) { openModal({ title: esc(label), bodyHTML: '<p class="text-sm text-red-500">数据解析失败</p>' }); }
     };
+  });
+
+  // 止损假设切换：改变所有 R 值的分母，切换后整页重算重渲染
+  el.querySelectorAll('[data-risk]').forEach(btn => {
+    btn.onclick = () => { setRiskPct(btn.dataset.risk); renderSignal(el); };
   });
 }
 
