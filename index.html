@@ -2784,7 +2784,10 @@ function renderSignal(el) {
       // 合并所有平台的 rDetails（按交易时间排序）
       const allDetails = acc.rows.reduce((s, r) => s.concat(r.rDetails || []), [])
         .sort((a, b) => a.tradedAt - b.tradedAt);
-      if (!allDetails.length) return '';
+      if (!allDetails.length) return `<div class="bg-white rounded-xl border border-dashed border-slate-300 p-6 text-center">
+        <div class="text-sm font-medium text-slate-600 mb-1">R 倍数分析待解锁</div>
+        <p class="text-xs text-slate-400">已闭环交易缺少有效的成本基数，无法计算 R 倍数。</p>
+      </div>`;
       // ---- R 分布统计量（期望值公式 + 分布形态诊断） ----
       const rs = allDetails.map(d => d.r);
       const n = rs.length;
@@ -2933,7 +2936,10 @@ function renderSignal(el) {
         <p class="text-xs mt-1 ${bigLossPct > 20 ? 'text-red-500' : 'text-slate-500'}">形态：${shapeText}；亏损占比 ${lossPct.toFixed(0)}%，≤-1R 大亏损占比 ${bigLossPct.toFixed(0)}%${bigLossPct > 20 ? '（止损执行不到位）' : ''}</p>
       </div>
     </div>`;
-    })() : ''}
+    })() : `<div class="bg-white rounded-xl border border-dashed border-slate-300 p-6 text-center">
+      <div class="text-sm font-medium text-slate-600 mb-1">R 倍数分析待解锁</div>
+      <p class="text-xs text-slate-400 leading-relaxed">需要至少 2 笔已闭环交易（买入后有对应卖出）。当前 ${acc.overall ? acc.overall.closed : 0} 笔。<br>R = 配对盈亏 ÷ (持仓成本 × 7% 止损假设)。</p>
+    </div>`}
 
     <div class="grid grid-cols-1 lg:grid-cols-2 gap-4">
       <!-- 滑点分布 -->
