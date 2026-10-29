@@ -2872,6 +2872,13 @@ function renderSignal(el) {
       const bw = Biw / buckets.length - 6;
       // R 神奇数字参考线位置（按 maxAbsR 估算）
       const maxAbsR = Math.max(2, ...allDetails.map(d => Math.abs(d.r)));
+      // 连续亏损统计（按平仓时间顺序）：风控核心指标，连亏越长越该停手
+      let maxStreak = 0, cur = 0, maxEnd = null;
+      for (const d of allDetails) {
+        if (d.r < 0) { cur++; if (cur > maxStreak) { maxStreak = cur; maxEnd = d; } }
+        else cur = 0;
+      }
+      const curStreak = cur; // 末尾尚未被盈利打断的连亏笔数
       return `
     ${acc.rows.length > 1 ? `<div class="flex flex-wrap items-center gap-1 text-xs mb-3">
       <span class="text-slate-500 mr-1">信号来源</span>
@@ -2886,6 +2893,8 @@ function renderSignal(el) {
           <span class="text-xs text-slate-400">最大回撤 ${drawdown.toFixed(2)}R</span>
         </div>
         <p class="text-xs text-slate-500 mb-2">期望值 = 胜率×均盈R − 败率×|均亏R| = ${(winRate*100).toFixed(0)}%×${avgWinR.toFixed(2)}R − ${((1-winRate)*100).toFixed(0)}%×${avgLossR.toFixed(2)}R = <span class="font-semibold ${expectancyR >= 0 ? 'text-red-600' : 'text-green-600'}">${expectancyR >= 0 ? '+' : ''}${expectancyR.toFixed(3)}R/笔</span></p>
+        <p class="text-xs text-slate-500 mb-2">最大连续亏损 <span class="font-semibold text-red-600">${maxStreak} 笔</span>${maxEnd ? `（止于 ${esc(maxEnd.symbol || '')}）` : ''} · 当前连亏 <span class="font-semibold ${curStreak >= 3 ? 'text-red-600' : 'text-slate-600'}">${curStreak} 笔</span></p>
+        ${curStreak >= 3 ? `<div class="mb-2 text-xs bg-amber-50 border border-amber-200 text-amber-700 rounded-lg px-3 py-2 leading-relaxed">风控提示：最近 ${curStreak} 笔连续亏损，建议暂停开仓，按纪律复盘后再交易。</div>` : ''}
         <div class="overflow-x-auto -mx-1 px-1"><svg viewBox="0 0 ${W} ${H}" class="h-auto w-full" style="min-width:400px">
           <!-- 网格线 -->
           <line x1="${pad.l}" y1="${pad.t}" x2="${pad.l}" y2="${H - pad.b}" stroke="#cbd5e1" stroke-width="1"/>
