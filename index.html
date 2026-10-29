@@ -2744,6 +2744,9 @@ function renderSignal(el) {
         R 倍数 = 配对盈亏 ÷ 名义风险（成本 × 7% 止损假设），期望值 = 总盈亏 ÷ 已闭环笔数，盈亏比 = 总盈利 ÷ |总亏损|（均基于 R）。
         本统计是对历史跟单结果的事后核对，<span class="text-slate-500">历史表现不代表未来，不构成对任何信号来源的推荐或评价</span>。
       </p>
+      ${acc.overall.executed === 0 ? `<div class="mb-3 text-xs bg-amber-50 border border-amber-200 text-amber-700 rounded-lg px-3 py-2 leading-relaxed">
+        尚未匹配到成交：已导入 ${signals.length} 条信号，但没有可匹配的成交记录，下方指标均为空。请先导入成交明细（信号与成交需落在 ±3600 秒窗口内）。
+      </div>` : ''}
       <div class="grid grid-cols-1 lg:grid-cols-2 gap-4">
         <div class="overflow-x-auto"><table class="min-w-full text-sm">
           <thead class="bg-slate-50 text-slate-500 text-xs"><tr>
@@ -2777,13 +2780,10 @@ function renderSignal(el) {
             <td class="px-3 py-2 text-right font-medium ${r.closed === 0 ? 'text-slate-400' : r.pnl >= 0 ? 'text-red-600' : 'text-green-600'}">${r.closed ? (r.pnl >= 0 ? '+' : '') + fmtMoney(r.pnl) : '—'}</td>
           </tr>`).join('') : '<tr><td colspan="6" class="px-3 py-6 text-center text-slate-400">无数据</td></tr>'}</tbody></table></div>
       </div>
-    </div>` : `<div class="bg-white rounded-xl border border-dashed border-slate-300 p-6 text-center">
-      <div class="text-sm font-medium text-slate-600 mb-1">尚无跟单结果可统计</div>
-      <p class="text-xs text-slate-400 leading-relaxed">已导入 ${signals.length} 条信号，但还没有匹配到成交记录。<br>请确认成交明细已导入，或检查信号时间与成交时间是否落在 ±3600 秒匹配窗口内。</p>
-    </div>`}
+    </div>` : ''}
 
     <!-- R 倍数分析：累计曲线 + 分布直方图（基于整体 rDetails） -->
-    ${!acc.overall ? '' : acc.overall.closed >= 2 ? (() => {
+    ${acc.overall && acc.overall.closed >= 2 ? (() => {
       // 合并所有平台的 rDetails（按交易时间排序）
       const allDetails = acc.rows.reduce((s, r) => s.concat(r.rDetails || []), [])
         .sort((a, b) => a.tradedAt - b.tradedAt);
