@@ -2389,6 +2389,9 @@ function setRiskPct(v) {
   if (RISK_OPTIONS.includes(Number(v))) localStorage.setItem(RISK_KEY, String(Number(v)));
 }
 
+// R 分析当前选中的信号来源（'all' 或 platform 值）；仅会话内记忆
+let rSrc = 'all';
+
 function computeSignalAccuracy() {
   const signals = q('SELECT * FROM signals WHERE user_id=$u ORDER BY signaled_at', { $u: LOCAL_USER_ID });
   if (!signals.length) return null;
@@ -2799,12 +2802,13 @@ function renderSignal(el) {
 
     <!-- R 倍数分析：累计曲线 + 分布直方图（基于整体 rDetails） -->
     ${acc.overall && acc.overall.closed >= 2 ? (() => {
-      // 合并所有平台的 rDetails（按交易时间排序）
-      const allDetails = acc.rows.reduce((s, r) => s.concat(r.rDetails || []), [])
+      // 按信号来源筛选后合并 rDetails（按交易时间排序）
+      const srcRows = rSrc === 'all' ? acc.rows : acc.rows.filter(r => r.platform === rSrc);
+      const allDetails = srcRows.reduce((s, r) => s.concat(r.rDetails || []), [])
         .sort((a, b) => a.tradedAt - b.tradedAt);
       if (!allDetails.length) return `<div class="bg-white rounded-xl border border-dashed border-slate-300 p-6 text-center">
-        <div class="text-sm font-medium text-slate-600 mb-1">R 倍数分析待解锁</div>
-        <p class="text-xs text-slate-400">已闭环交易缺少有效的成本基数，无法计算 R 倍数。</p>
+        <div class="text-sm font-medium text-slate-600 mb-1">当前来源暂无可分析的 R</div>
+        <p class="text-xs text-slate-400">${rSrc === 'all' ? '已闭环交易缺少有效的成本基数' : '该信号来源下暂无已闭环交易'}，切回「全部」可查看整体分布。</p>
       </div>`;
       // ---- R 分布统计量（期望值公式 + 分布形态诊断） ----
       const rs = allDetails.map(d => d.r);
@@ -2869,6 +2873,11 @@ function renderSignal(el) {
       // R 神奇数字参考线位置（按 maxAbsR 估算）
       const maxAbsR = Math.max(2, ...allDetails.map(d => Math.abs(d.r)));
       return `
+    ${acc.rows.length > 1 ? `<div class="flex flex-wrap items-center gap-1 text-xs mb-3">
+      <span class="text-slate-500 mr-1">信号来源</span>
+      ${[['all', '全部']].concat(acc.rows.map(r => [r.platform, PLATFORM_LABEL[r.platform] || r.platform])).map(([k, label]) =>
+        `<button data-rsrc="${k}" class="px-2 py-0.5 rounded border ${rSrc === k ? 'bg-indigo-600 text-white border-indigo-600' : 'bg-white border-slate-300 text-slate-600 hover:bg-slate-50'}">${esc(label)}</button>`).join('')}
+    </div>` : ''}
     <div class="grid grid-cols-1 lg:grid-cols-2 gap-4">
       <!-- 累计 R 曲线 -->
       <div class="bg-white rounded-xl border border-slate-200 p-5">
@@ -3079,6 +3088,11 @@ function renderSignal(el) {
   // 止损假设切换：改变所有 R 值的分母，切换后整页重算重渲染
   el.querySelectorAll('[data-risk]').forEach(btn => {
     btn.onclick = () => { setRiskPct(btn.dataset.risk); renderSignal(el); };
+  });
+
+  // 信号来源切换：只看某个来源的 R 分布与累计曲线
+  el.querySelectorAll('[data-rsrc]').forEach(btn => {
+    btn.onclick = () => { rSrc = btn.dataset.rsrc; renderSignal(el); };
   });
 }
 
