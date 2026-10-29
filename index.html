@@ -1854,6 +1854,47 @@ function renderDashboard(el) {
         </div>
       </div>
 
+      <!-- 持仓时长 vs 盈亏散点图 -->
+      <div class="bg-white rounded-xl border border-slate-200 p-5">
+        <h3 class="font-semibold text-sm mb-3">持仓时长 vs 盈亏 <span class="text-xs font-normal text-slate-400">每笔一个点 · 红盈绿亏</span></h3>
+        ${(() => {
+          const maxDays = Math.max(...closed.map(c => c.holdingDays), 1);
+          const maxAbsPnl = Math.max(...closed.map(c => Math.abs(c.pnl)), 1);
+          const W = 400, H = 220, pad = { l: 45, r: 15, t: 15, b: 30 };
+          const iw = W - pad.l - pad.r, ih = H - pad.t - pad.b;
+          const x = d => pad.l + (d / maxDays) * iw;
+          const y = p => pad.t + ih / 2 - (p / maxAbsPnl) * (ih / 2) * 0.9;
+          const pts = closed.map(c => {
+            const px = x(c.holdingDays), py = y(c.pnl);
+            const col = c.pnl >= 0 ? '#dc2626' : '#16a34a';
+            return `<circle cx="${px.toFixed(1)}" cy="${py.toFixed(1)}" r="4" fill="${col}" fill-opacity="0.7" stroke="${col}" stroke-width="1" class="scatter-pt" data-pair="${c.pairId}" style="cursor:pointer"><title>${c.symbolName} · ${c.holdingDays}天 · ${pnlTxt(c.pnl)}</title></circle>`;
+          }).join('');
+          const gridY = [0, 0.5, 1].map(f => {
+            const gy = pad.t + ih / 2 - (f - 0.5) * ih * 0.9;
+            return `<line x1="${pad.l}" y1="${gy}" x2="${W - pad.r}" y2="${gy}" stroke="#e2e8f0" stroke-width="1"/>`;
+          }).join('');
+          const labelY = [1, 0, -1].map(f => {
+            const gy = pad.t + ih / 2 - (f * 0.9) * ih / 2;
+            const v = Math.round(maxAbsPnl * f * 0.9);
+            return `<text x="${pad.l - 6}" y="${gy + 4}" text-anchor="end" font-size="10" fill="#94a3b8">${fmtMoney(v)}</text>`;
+          }).join('');
+          return `<svg viewBox="0 0 ${W} ${H}" class="w-full h-auto">
+            <line x1="${pad.l}" y1="${pad.t}" x2="${pad.l}" y2="${H - pad.b}" stroke="#cbd5e1" stroke-width="1"/>
+            <line x1="${pad.l}" y1="${H - pad.b}" x2="${W - pad.r}" y2="${H - pad.b}" stroke="#cbd5e1" stroke-width="1"/>
+            <line x1="${pad.l}" y1="${pad.t + ih / 2}" x2="${W - pad.r}" y2="${pad.t + ih / 2}" stroke="#cbd5e1" stroke-width="1" stroke-dasharray="4,3"/>
+            ${gridY}
+            ${labelY}
+            <text x="${pad.l - 6}" y="${pad.t + ih / 2 + 4}" text-anchor="end" font-size="10" fill="#64748b" font-weight="500">0</text>
+            <text x="${(pad.l + W - pad.r) / 2}" y="${H - 6}" text-anchor="middle" font-size="10" fill="#94a3b8">持仓天数</text>
+            <text x="${pad.l - 30}" y="${pad.t + 8}" font-size="10" fill="#94a3b8" transform="rotate(-90 ${pad.l - 30} ${pad.t + 8})" text-anchor="end">盈亏</text>
+            ${pts}
+          </svg>`;
+        })()}
+        <p class="text-xs text-slate-400 mt-2">右上=拿得住且赚；右下=拿得住但亏；左上=短炒赚钱；左下=短炒亏钱。点击点可溯源。</p>
+      </div>
+    </div>
+
+    <div class="grid grid-cols-1 lg:grid-cols-2 gap-4">
       <!-- 个股盈亏排名 -->
       <div class="bg-white rounded-xl border border-slate-200 p-5">
         <h3 class="font-semibold text-sm mb-3">个股盈亏排名（已实现，Top5）</h3>
@@ -1954,6 +1995,11 @@ function renderDashboard(el) {
   el.querySelectorAll('.tag-row').forEach(b => b.onclick = () => {
     const t = tagList.find(x => x.tag === b.dataset.tag);
     showClosedTrace(`标签「${t.tag}」相关交易（合计 ${pnlTxt(t.pnl)}）`, t.trades);
+  });
+  // 散点图点击溯源：单笔完整交易
+  el.querySelectorAll('.scatter-pt').forEach(pt => pt.onclick = () => {
+    const c = closed.find(x => x.pairId === pt.dataset.pair);
+    if (c) showClosedTrace(`${c.symbolName} · ${c.holdingDays}天 · ${pnlTxt(c.pnl)}`, [c]);
   });
 }
 
