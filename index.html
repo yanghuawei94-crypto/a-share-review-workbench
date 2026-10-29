@@ -2786,13 +2786,17 @@ function renderSignal(el) {
         .sort((a, b) => a.tradedAt - b.tradedAt);
       if (!allDetails.length) return '';
       // ---- 累计 R 曲线 ----
-      let cum = 0; let cumMax = 0; let cumMaxIdx = 0; let cumMin = 0; let cumMinIdx = 0;
-      const cumArr = allDetails.map((d, i) => {
-        cum += d.r;
-        if (cum > cumMax) { cumMax = cum; cumMaxIdx = i; }
-        if (cum < cumMin) { cumMin = cum; cumMinIdx = i; }
-        return cum;
-      });
+      const cumArr = []; let cum = 0;
+      allDetails.forEach(d => { cum += d.r; cumArr.push(cum); });
+      // 滚动峰值法求最大回撤（峰值一定在谷值之前）
+      let peak = cumArr[0], peakIdx = 0, maxDD = 0, troughIdx = 0;
+      for (let i = 1; i < cumArr.length; i++) {
+        if (cumArr[i] > peak) { peak = cumArr[i]; peakIdx = i; }
+        const dd = peak - cumArr[i];
+        if (dd > maxDD) { maxDD = dd; troughIdx = i; }
+      }
+      const cumMax = peak, cumMaxIdx = peakIdx, cumMin = cumArr[troughIdx], cumMinIdx = troughIdx;
+      const drawdown = maxDD;
       const W = 420, H = 220, pad = { l: 40, r: 15, t: 20, b: 30 };
       const iw = W - pad.l - pad.r, ih = H - pad.t - pad.b;
       const yAll = [...cumArr, 0];
@@ -2805,8 +2809,6 @@ function renderSignal(el) {
       let pathD = `M ${x(0)} ${y(cumArr[0])}`;
       const pts = cumArr.map((v, i) => { pathD += ` L ${x(i)} ${y(v)}`; return v; });
       const areaD = pathD + ` L ${x(cumArr.length-1)} ${y(0)} L ${x(0)} ${y(0)} Z`;
-      // 回撤区域（从 cumMaxIdx 到 cumMinIdx）
-      const drawdown = Math.max(0, cumMax - cumMin);
       // ---- R 分布直方图 ----
       const buckets = [
         { label: '≤-2R', min: -Infinity, max: -2 },
@@ -2845,6 +2847,11 @@ function renderSignal(el) {
           <path d="${areaD}" fill="${cumArr[cumArr.length-1] >= 0 ? '#bbf7d0' : '#fecaca'}" fill-opacity="0.5"/>
           <!-- 折线 -->
           <path d="${pathD}" fill="none" stroke="${cumArr[cumArr.length-1] >= 0 ? '#16a34a' : '#dc2626'}" stroke-width="2"/>
+          <!-- 每笔透明 hover 点（显示 R 值 + 标的 + 平仓时间） -->
+          ${cumArr.map((v, i) => `
+            <circle cx="${x(i)}" cy="${y(v)}" r="6" fill="transparent" style="cursor:pointer">
+              <title>#${i+1} ${allDetails[i].symbol}\nR: ${v>=0?'+':''}${v.toFixed(2)}R · 盈亏 ${allDetails[i].pnl>=0?'+':''}${fmtMoney(allDetails[i].pnl)}\n平仓: ${fmtDateTime(allDetails[i].tradedAt)}</title>
+            </circle>`).join('')}
           <!-- 0R 基准标签 -->
           <text x="${pad.l - 6}" y="${y(0) + 4}" text-anchor="end" font-size="10" fill="#64748b" font-weight="500">0R</text>
           <!-- 最高/最低点标注 -->
@@ -2868,8 +2875,13 @@ function renderSignal(el) {
           <!-- 坐标轴 -->
           <line x1="${Bpad.l}" y1="${Bpad.t}" x2="${Bpad.l}" y2="${BH - Bpad.b}" stroke="#cbd5e1" stroke-width="1"/>
           <line x1="${Bpad.l}" y1="${BH - Bpad.b}" x2="${BW - Bpad.r}" y2="${BH - Bpad.b}" stroke="#cbd5e1" stroke-width="1"/>
-          <!-- y 轴刻度 -->
-          ${[0, maxCount/2, maxCount].map((v, i) => `<line x1="${Bpad.l}" y1="${Bpad.t + Bih - (v/maxCount)*Bih}" x2="${BW - Bpad.r}" y2="${Bpad.t + Bih - (v/maxCount)*Bih}" stroke="#f1f5f9" stroke-width="1"/><text x="${Bpad.l - 6}" y="${Bpad.t + Bih - (v/maxCount)*Bih + 4}" text-anchor="end" font-size="10" fill="#94a3b8">${Math.round(v)}</text>`).join('')}
+          <!-- y 轴刻度（整数） -->
+          ${Array.from({length: Math.min(maxCount + 1, 6)}, (_, i) => {
+            const step = maxCount <= 5 ? 1 : Math.ceil(maxCount / 5);
+            const v = i * step;
+            if (v > maxCount) return '';
+            return `<line x1="${Bpad.l}" y1="${Bpad.t + Bih - (v/maxCount)*Bih}" x2="${BW - Bpad.r}" y2="${Bpad.t + Bih - (v/maxCount)*Bih}" stroke="#f1f5f9" stroke-width="1"/><text x="${Bpad.l - 6}" y="${Bpad.t + Bih - (v/maxCount)*Bih + 4}" text-anchor="end" font-size="10" fill="#94a3b8">${v}</text>`;
+          }).join('')}
           <!-- 柱状图 -->
           ${buckets.map((b, i) => {
             const count = b.details.length;
@@ -2882,9 +2894,15 @@ function renderSignal(el) {
             return `<rect x="${bx}" y="${by}" width="${bw}" height="${h}" fill="${col}" fill-opacity="0.75" rx="3" class="rb-bar" data-b="${i}" data-details="${detailJson}" data-label="${b.label}" style="cursor:pointer"><title>${b.label}: ${count} 笔\n${tip}</title></rect>
             <text x="${bx + bw/2}" y="${BH - Bpad.b + 14}" text-anchor="middle" font-size="10" fill="#64748b">${b.label}</text>`;
           }).join('')}
-          <!-- R 神奇数字参考线：在 x 轴下方标注（因为是分桶，参考线放在分桶边界上） -->
-          <text x="${Bpad.l + (buckets.findIndex(b=>b.max===0)/buckets.length)*Biw}" y="${BH - 8}" text-anchor="middle" font-size="10" fill="#f59e0b" font-weight="600">0R</text>
-          <text x="${Bpad.l + (buckets.findIndex(b=>b.max===-1)/buckets.length)*Biw}" y="${BH - 8}" text-anchor="middle" font-size="10" fill="#94a3b8">±1R</text>
+          <!-- R 神奇数字参考线（-2R/-1R/0R/+1R/+2R 竖线贯穿图表） -->
+          ${[-2, -1, 0, 1, 2].map(r => {
+            // 桶边界位置：bucket i 的右边界 = (i+1)/buckets.length
+            const idx = r + 2; // -2→0边界, -1→1边界, 0→2边界, 1→3边界, 2→4边界
+            const lx = Bpad.l + (idx / buckets.length) * Biw;
+            const isZero = r === 0;
+            return `<line x1="${lx}" y1="${Bpad.t}" x2="${lx}" y2="${BH - Bpad.b}" stroke="${isZero ? '#f59e0b' : '#e2e8f0'}" stroke-width="${isZero ? 1.5 : 1}" stroke-dasharray="${isZero ? '4,3' : '2,4'}"/>
+            <text x="${lx}" y="${BH - 8}" text-anchor="middle" font-size="9" fill="${isZero ? '#f59e0b' : '#94a3b8'}" font-weight="${isZero ? '600' : '400'}">${r > 0 ? '+' : ''}${r}R</text>`;
+          }).join('')}
         </svg>
         <p class="text-xs text-slate-400 mt-2">红柱=亏损区间，绿柱=盈利区间。鼠标悬停查看该桶内标的明细。风险口径：盈亏 ÷ 成本×7% 止损假设。</p>
       </div>
